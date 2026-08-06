@@ -1,0 +1,27 @@
+{
+  "name": "lifelink",
+  "version": "1.0.0",
+  "description": "Smart Ambulance Response System",
+  "private": true,
+  "workspaces": [
+    "backend",
+    "mobile-patient",
+    "mobile-driver",
+    "hospital-dashboard",
+    "admin-dashboard"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:patient": "npm run start --workspace=mobile-patient",
+    "dev:driver": "npm run start --workspace=mobile-driver",
+    "dev:hospital": "npm run dev --workspace=hospital-dashboard",
+    "dev:admin": "npm run dev --workspace=admin-dashboard",
+    "lint": "npm run lint --workspaces --if-present",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "typecheck": "npm run typecheck --workspaces --if-present"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.6"
+  }
+}
