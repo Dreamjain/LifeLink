@@ -6,3 +6,574 @@ datasource db {
   provider = "postgresql"
   url      = env("DATABASE_URL")
 }
+
+enum UserRole {
+  PATIENT
+  DRIVER
+  HOSPITAL_STAFF
+  ADMIN
+}
+
+enum UserStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  DEACTIVATED
+  REJECTED
+}
+
+enum HospitalStatus {
+  PENDING_VERIFICATION
+  VERIFIED
+  TEMPORARILY_UNAVAILABLE
+  SUSPENDED
+  REJECTED
+}
+
+enum AmbulanceStatus {
+  AVAILABLE
+  OFFERED
+  ASSIGNED
+  EN_ROUTE
+  OUT_OF_SERVICE
+  INACTIVE
+}
+
+enum BedStatus {
+  AVAILABLE
+  RESERVED
+  OCCUPIED
+  OUT_OF_SERVICE
+}
+
+enum EmergencyStatus {
+  CREATED
+  SEARCHING_HOSPITAL
+  PENDING_HOSPITAL_RESPONSE
+  HOSPITAL_REJECTED
+  HOSPITAL_ACCEPTED
+  BED_RESERVED
+  AMBULANCE_ASSIGNED
+  PENDING_DRIVER_ACCEPTANCE
+  DRIVER_EN_ROUTE
+  AT_PICKUP
+  TRANSPORTING
+  AT_HOSPITAL
+  ADMITTED
+  COMPLETED
+  CANCELLED
+  ESCALATED
+  EXPIRED
+}
+
+enum HospitalResponseStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  WITHDRAWN
+}
+
+enum AmbulanceAssignmentStatus {
+  OFFERED
+  ACCEPTED
+  REJECTED
+  CANCELLED
+  EN_ROUTE
+  AT_PICKUP
+  TRANSPORTING
+  COMPLETED
+  FAILED
+}
+
+enum BedReservationStatus {
+  RESERVED
+  RELEASED
+  EXPIRED
+  CONSUMED
+  FAILED
+}
+
+enum DoctorAssignmentStatus {
+  ASSIGNED
+  RELEASED
+  COMPLETED
+  CANCELLED
+}
+
+enum NotificationChannel {
+  IN_APP
+  SIMULATED_CONTACT
+  SMS
+  WHATSAPP
+  PUSH
+  EMAIL
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  DELIVERED
+  READ
+  FAILED
+  CANCELLED
+}
+
+enum BloodGroup {
+  A_POSITIVE
+  A_NEGATIVE
+  B_POSITIVE
+  B_NEGATIVE
+  AB_POSITIVE
+  AB_NEGATIVE
+  O_POSITIVE
+  O_NEGATIVE
+  UNKNOWN
+}
+
+enum MedicalReportType {
+  PRESCRIPTION
+  LAB_REPORT
+  SCAN
+  DISCHARGE_SUMMARY
+  MEDICAL_HISTORY
+  OTHER
+}
+
+enum ConsentStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+enum HospitalStaffRole {
+  ADMIN
+  DISPATCHER
+  RECEPTIONIST
+  CLINICAL_COORDINATOR
+}
+
+enum MembershipStatus {
+  ACTIVE
+  SUSPENDED
+  REMOVED
+}
+
+enum DoctorStatus {
+  AVAILABLE
+  BUSY
+  ON_LEAVE
+  INACTIVE
+}
+
+enum BedType {
+  GENERAL
+  ICU
+  EMERGENCY
+  ISOLATION
+}
+
+enum AmbulanceType {
+  BASIC_LIFE_SUPPORT
+  ADVANCED_LIFE_SUPPORT
+  PATIENT_TRANSPORT
+}
+
+enum EmergencyType {
+  SOS
+  AMBULANCE_REQUEST
+}
+
+enum Severity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+  UNKNOWN
+}
+
+enum VerificationStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum DriverAvailability {
+  OFFLINE
+  AVAILABLE
+  BUSY
+  ON_BREAK
+  SUSPENDED
+}
+
+enum NotificationType {
+  EMERGENCY_CREATED
+  HOSPITAL_REQUEST
+  HOSPITAL_ACCEPTED
+  HOSPITAL_REJECTED
+  AMBULANCE_ASSIGNED
+  DRIVER_ASSIGNED
+  DRIVER_EN_ROUTE
+  PATIENT_PICKED_UP
+  HOSPITAL_ARRIVAL
+  PATIENT_ADMITTED
+  EMERGENCY_COMPLETED
+  EMERGENCY_CANCELLED
+  GENERAL
+}
+
+enum TransitionActorType {
+  SYSTEM
+  PATIENT
+  HOSPITAL_STAFF
+  DRIVER
+  ADMIN
+}
+
+model User {
+  id                  String                    @id @default(uuid()) @db.Uuid
+  phone               String                    @unique @db.VarChar(20)
+  email               String?                   @unique @db.VarChar(254)
+  passwordHash        String?                   @db.VarChar(255)
+  role                UserRole
+  status              UserStatus                @default(PENDING)
+  displayName         String                    @db.VarChar(120)
+  createdAt           DateTime                  @default(now()) @db.Timestamptz(6)
+  updatedAt           DateTime                  @updatedAt @db.Timestamptz(6)
+  patientProfile      PatientProfile?
+  driverProfile       DriverProfile?
+  hospitalMemberships HospitalStaffMembership[]
+  hospitalResponses   HospitalResponse[]        @relation("HospitalResponseResponder")
+  bedReservations     BedReservation[]          @relation("BedReservationReserver")
+  doctorAssignments   DoctorAssignment[]        @relation("DoctorAssignmentAssigner")
+  statusHistory       EmergencyStatusHistory[]  @relation("StatusHistoryActor")
+  notifications       Notification[]            @relation("NotificationUserRecipient")
+}
+
+model PatientProfile {
+  id                String             @id @default(uuid()) @db.Uuid
+  userId            String             @unique @db.Uuid
+  dateOfBirth       DateTime?          @db.Date
+  gender            String?            @db.VarChar(32)
+  bloodGroup        BloodGroup?
+  allergies         String?            @db.Text
+  medicalSummary    String?            @db.Text
+  addressLine       String?            @db.VarChar(255)
+  city              String?            @db.VarChar(100)
+  state             String?            @db.VarChar(100)
+  postalCode        String?            @db.VarChar(20)
+  createdAt         DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt         DateTime           @updatedAt @db.Timestamptz(6)
+  user              User               @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  emergencyContacts EmergencyContact[]
+  medicalReports    MedicalReport[]
+  emergencyRequests EmergencyRequest[]
+}
+
+model EmergencyContact {
+  id            String         @id @default(uuid()) @db.Uuid
+  patientId     String         @db.Uuid
+  name          String         @db.VarChar(120)
+  relationship  String         @db.VarChar(60)
+  phone         String         @db.VarChar(20)
+  isPrimary     Boolean        @default(false)
+  createdAt     DateTime       @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime       @updatedAt @db.Timestamptz(6)
+  patient       PatientProfile @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  notifications Notification[] @relation("NotificationContactRecipient")
+
+  @@index([patientId])
+}
+
+model MedicalReport {
+  id            String            @id @default(uuid()) @db.Uuid
+  patientId     String            @db.Uuid
+  reportType    MedicalReportType @default(OTHER)
+  displayName   String            @db.VarChar(255)
+  storageKey    String            @unique @db.VarChar(512)
+  mimeType      String            @db.VarChar(100)
+  sizeBytes     Int
+  checksum      String?           @db.VarChar(128)
+  consentStatus ConsentStatus     @default(ACTIVE)
+  createdAt     DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime          @updatedAt @db.Timestamptz(6)
+  patient       PatientProfile    @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([patientId])
+}
+
+model Hospital {
+  id                 String                    @id @default(uuid()) @db.Uuid
+  name               String                    @db.VarChar(180)
+  registrationNumber String                    @unique @db.VarChar(100)
+  phone              String                    @db.VarChar(20)
+  email              String?                   @unique @db.VarChar(254)
+  addressLine        String                    @db.VarChar(255)
+  city               String                    @db.VarChar(100)
+  state              String                    @db.VarChar(100)
+  postalCode         String                    @db.VarChar(20)
+  latitude           Decimal?                  @db.Decimal(9, 6)
+  longitude          Decimal?                  @db.Decimal(9, 6)
+  capabilities       Json                      @default("[]") @db.JsonB
+  status             HospitalStatus            @default(PENDING_VERIFICATION)
+  createdAt          DateTime                  @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime                  @updatedAt @db.Timestamptz(6)
+  staffMemberships   HospitalStaffMembership[]
+  doctors            Doctor[]
+  beds               Bed[]
+  ambulances         Ambulance[]
+  hospitalResponses  HospitalResponse[]
+}
+
+model HospitalStaffMembership {
+  id         String            @id @default(uuid()) @db.Uuid
+  hospitalId String            @db.Uuid
+  userId     String            @db.Uuid
+  staffRole  HospitalStaffRole
+  status     MembershipStatus  @default(ACTIVE)
+  createdAt  DateTime          @default(now()) @db.Timestamptz(6)
+  updatedAt  DateTime          @updatedAt @db.Timestamptz(6)
+  hospital   Hospital          @relation(fields: [hospitalId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  user       User              @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([hospitalId, userId])
+  @@index([userId])
+}
+
+model Doctor {
+  id                 String             @id @default(uuid()) @db.Uuid
+  hospitalId         String             @db.Uuid
+  name               String             @db.VarChar(120)
+  registrationNumber String             @unique @db.VarChar(100)
+  specialty          String?            @db.VarChar(100)
+  status             DoctorStatus       @default(AVAILABLE)
+  createdAt          DateTime           @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime           @updatedAt @db.Timestamptz(6)
+  hospital           Hospital           @relation(fields: [hospitalId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignments        DoctorAssignment[]
+
+  @@index([hospitalId])
+}
+
+model Bed {
+  id           String           @id @default(uuid()) @db.Uuid
+  hospitalId   String           @db.Uuid
+  bedCode      String           @db.VarChar(50)
+  bedType      BedType          @default(GENERAL)
+  status       BedStatus        @default(AVAILABLE)
+  createdAt    DateTime         @default(now()) @db.Timestamptz(6)
+  updatedAt    DateTime         @updatedAt @db.Timestamptz(6)
+  hospital     Hospital         @relation(fields: [hospitalId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  reservations BedReservation[]
+
+  @@unique([hospitalId, bedCode])
+  @@index([hospitalId, status])
+}
+
+model Ambulance {
+  id            String                @id @default(uuid()) @db.Uuid
+  hospitalId    String                @db.Uuid
+  vehicleNumber String                @unique @db.VarChar(30)
+  ambulanceType AmbulanceType         @default(BASIC_LIFE_SUPPORT)
+  capabilities  Json                  @default("[]") @db.JsonB
+  status        AmbulanceStatus       @default(AVAILABLE)
+  createdAt     DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt     DateTime              @updatedAt @db.Timestamptz(6)
+  hospital      Hospital              @relation(fields: [hospitalId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignments   AmbulanceAssignment[]
+
+  @@index([status])
+  @@index([hospitalId])
+}
+
+model DriverProfile {
+  id                 String                @id @default(uuid()) @db.Uuid
+  userId             String                @unique @db.Uuid
+  licenceNumber      String                @unique @db.VarChar(80)
+  verificationStatus VerificationStatus    @default(PENDING)
+  availabilityStatus DriverAvailability    @default(OFFLINE)
+  createdAt          DateTime              @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime              @updatedAt @db.Timestamptz(6)
+  user               User                  @relation(fields: [userId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignments        AmbulanceAssignment[]
+
+  @@index([availabilityStatus])
+}
+
+model EmergencyRequest {
+  id                   String                   @id @default(uuid()) @db.Uuid
+  patientId            String                   @db.Uuid
+  requestType          EmergencyType            @default(SOS)
+  severity             Severity                 @default(UNKNOWN)
+  currentStatus        EmergencyStatus          @default(CREATED)
+  description          String?                  @db.Text
+  pickupAddress        String?                  @db.VarChar(500)
+  pickupLatitude       Decimal?                 @db.Decimal(9, 6)
+  pickupLongitude      Decimal?                 @db.Decimal(9, 6)
+  idempotencyKey       String?                  @unique @db.VarChar(128)
+  cancelledAt          DateTime?                @db.Timestamptz(6)
+  completedAt          DateTime?                @db.Timestamptz(6)
+  expiresAt            DateTime?                @db.Timestamptz(6)
+  createdAt            DateTime                 @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime                 @updatedAt @db.Timestamptz(6)
+  patient              PatientProfile           @relation(fields: [patientId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  hospitalResponses    HospitalResponse[]
+  ambulanceAssignments AmbulanceAssignment[]
+  bedReservations      BedReservation[]
+  doctorAssignments    DoctorAssignment[]
+  statusHistory        EmergencyStatusHistory[]
+  notifications        Notification[]
+
+  @@index([currentStatus])
+  @@index([patientId])
+}
+
+model HospitalResponse {
+  id                   String                 @id @default(uuid()) @db.Uuid
+  emergencyId          String                 @db.Uuid
+  hospitalId           String                 @db.Uuid
+  attemptNumber        Int                    @default(1) @db.SmallInt
+  status               HospitalResponseStatus @default(PENDING)
+  rank                 Int?
+  estimatedDistanceKm  Decimal?               @db.Decimal(8, 2)
+  responseByUserId     String?                @db.Uuid
+  rejectionReason      String?                @db.Text
+  offeredAt            DateTime               @default(now()) @db.Timestamptz(6)
+  respondedAt          DateTime?              @db.Timestamptz(6)
+  expiresAt            DateTime?              @db.Timestamptz(6)
+  createdAt            DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt            DateTime               @updatedAt @db.Timestamptz(6)
+  emergency            EmergencyRequest       @relation(fields: [emergencyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  hospital             Hospital               @relation(fields: [hospitalId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  responseBy           User?                  @relation("HospitalResponseResponder", fields: [responseByUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ambulanceAssignments AmbulanceAssignment[]
+  bedReservations      BedReservation[]
+
+  @@unique([emergencyId, hospitalId, attemptNumber])
+  @@index([emergencyId, status])
+  @@index([hospitalId])
+  @@index([responseByUserId])
+}
+
+model AmbulanceAssignment {
+  id                 String                    @id @default(uuid()) @db.Uuid
+  emergencyId        String                    @db.Uuid
+  hospitalResponseId String                    @db.Uuid
+  ambulanceId        String                    @db.Uuid
+  driverId           String                    @db.Uuid
+  attemptNumber      Int                       @default(1) @db.SmallInt
+  status             AmbulanceAssignmentStatus @default(OFFERED)
+  rejectionReason    String?                   @db.Text
+  assignedAt         DateTime                  @default(now()) @db.Timestamptz(6)
+  respondedAt        DateTime?                 @db.Timestamptz(6)
+  startedAt          DateTime?                 @db.Timestamptz(6)
+  endedAt            DateTime?                 @db.Timestamptz(6)
+  createdAt          DateTime                  @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime                  @updatedAt @db.Timestamptz(6)
+  emergency          EmergencyRequest          @relation(fields: [emergencyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  hospitalResponse   HospitalResponse          @relation(fields: [hospitalResponseId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  ambulance          Ambulance                 @relation(fields: [ambulanceId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  driver             DriverProfile             @relation(fields: [driverId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@unique([emergencyId, attemptNumber])
+  @@index([emergencyId, status])
+  @@index([hospitalResponseId])
+  @@index([ambulanceId])
+  @@index([driverId])
+}
+
+model BedReservation {
+  id                 String               @id @default(uuid()) @db.Uuid
+  emergencyId        String               @db.Uuid
+  hospitalResponseId String               @db.Uuid
+  bedId              String               @db.Uuid
+  status             BedReservationStatus @default(RESERVED)
+  reservedByUserId   String?              @db.Uuid
+  reservedAt         DateTime             @default(now()) @db.Timestamptz(6)
+  expiresAt          DateTime?            @db.Timestamptz(6)
+  releasedAt         DateTime?            @db.Timestamptz(6)
+  releaseReason      String?              @db.Text
+  createdAt          DateTime             @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime             @updatedAt @db.Timestamptz(6)
+  emergency          EmergencyRequest     @relation(fields: [emergencyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  hospitalResponse   HospitalResponse     @relation(fields: [hospitalResponseId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  bed                Bed                  @relation(fields: [bedId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  reservedBy         User?                @relation("BedReservationReserver", fields: [reservedByUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([emergencyId])
+  @@index([hospitalResponseId])
+  @@index([bedId])
+  @@index([reservedByUserId])
+}
+
+model DoctorAssignment {
+  id               String                 @id @default(uuid()) @db.Uuid
+  emergencyId      String                 @db.Uuid
+  doctorId         String                 @db.Uuid
+  status           DoctorAssignmentStatus @default(ASSIGNED)
+  assignedByUserId String?                @db.Uuid
+  assignedAt       DateTime               @default(now()) @db.Timestamptz(6)
+  releasedAt       DateTime?              @db.Timestamptz(6)
+  releaseReason    String?                @db.Text
+  createdAt        DateTime               @default(now()) @db.Timestamptz(6)
+  updatedAt        DateTime               @updatedAt @db.Timestamptz(6)
+  emergency        EmergencyRequest       @relation(fields: [emergencyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  doctor           Doctor                 @relation(fields: [doctorId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  assignedBy       User?                  @relation("DoctorAssignmentAssigner", fields: [assignedByUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([emergencyId])
+  @@index([doctorId])
+  @@index([assignedByUserId])
+}
+
+model EmergencyStatusHistory {
+  id          String              @id @default(uuid()) @db.Uuid
+  emergencyId String              @db.Uuid
+  fromStatus  EmergencyStatus?
+  toStatus    EmergencyStatus
+  actorUserId String?             @db.Uuid
+  actorType   TransitionActorType @default(SYSTEM)
+  reason      String?             @db.Text
+  metadata    Json                @default("{}") @db.JsonB
+  occurredAt  DateTime            @default(now()) @db.Timestamptz(6)
+  emergency   EmergencyRequest    @relation(fields: [emergencyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  actorUser   User?               @relation("StatusHistoryActor", fields: [actorUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([emergencyId, occurredAt])
+  @@index([actorUserId])
+}
+
+model Notification {
+  id                 String              @id @default(uuid()) @db.Uuid
+  emergencyId        String              @db.Uuid
+  recipientUserId    String?             @db.Uuid
+  emergencyContactId String?             @db.Uuid
+  channel            NotificationChannel @default(IN_APP)
+  type               NotificationType
+  status             NotificationStatus  @default(PENDING)
+  title              String              @db.VarChar(160)
+  payload            Json                @default("{}") @db.JsonB
+  scheduledAt        DateTime?           @db.Timestamptz(6)
+  sentAt             DateTime?           @db.Timestamptz(6)
+  readAt             DateTime?           @db.Timestamptz(6)
+  failedAt           DateTime?           @db.Timestamptz(6)
+  failureReason      String?             @db.Text
+  createdAt          DateTime            @default(now()) @db.Timestamptz(6)
+  updatedAt          DateTime            @updatedAt @db.Timestamptz(6)
+  emergency          EmergencyRequest    @relation(fields: [emergencyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  recipientUser      User?               @relation("NotificationUserRecipient", fields: [recipientUserId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+  emergencyContact   EmergencyContact?   @relation("NotificationContactRecipient", fields: [emergencyContactId], references: [id], onDelete: Restrict, onUpdate: Cascade)
+
+  @@index([emergencyId, status])
+  @@index([recipientUserId])
+  @@index([emergencyContactId])
+}
+
+// Constraints Requiring Custom SQL or Application Logic:
+// - Exactly one Notification recipient (recipientUserId XOR emergencyContactId).
+// - One primary EmergencyContact per patient.
+// - One active BedReservation per emergency and per bed.
+// - One active AmbulanceAssignment per ambulance and per driver.
+// - One active accepted HospitalResponse per emergency.
+// - Coordinate ranges, non-negative distance/file-size values, and role/profile compatibility.
+// - Allowed EmergencyStatus transitions and append-only EmergencyStatusHistory enforcement.
