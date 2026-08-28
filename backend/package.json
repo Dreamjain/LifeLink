@@ -14,7 +14,8 @@
     "typecheck": "tsc --noEmit",
     "prisma:validate": "prisma validate --schema prisma/schema.prisma",
     "prisma:generate": "prisma generate --schema prisma/schema.prisma",
-    "test": "vitest run"
+    "test": "vitest run",
+    "seed:admin": "tsx prisma/seed-admin.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
