@@ -5,3 +5,6 @@ export type {
   SignAccessTokenInput,
   AuthenticatedPrincipal,
 } from './types/auth.types.js';
+export { authRouter } from './routes/auth.routes.js';
+export { requireAuth } from './middleware/auth.middleware.js';
+export { requireRole } from './middleware/role.middleware.js';
