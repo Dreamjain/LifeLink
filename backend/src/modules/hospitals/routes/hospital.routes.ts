@@ -20,6 +20,18 @@ import {
   listAmbulances,
   updateAmbulance,
 } from '../controllers/ambulance.controller.js';
+import {
+  acceptResponse,
+  getResponse,
+  listResponses,
+  rejectResponse,
+} from '../controllers/hospital-response.controller.js';
+import {
+  createReservation,
+  getReservation,
+  listReservations,
+  releaseReservation,
+} from '../controllers/bed-reservation.controller.js';
 
 export const hospitalRouter = Router();
 
@@ -27,6 +39,13 @@ export const hospitalRouter = Router();
 hospitalRouter.use(requireAuth, requireRole(UserRole.HOSPITAL_STAFF), requireHospitalMembership);
 
 const requireHospitalAdmin = requireHospitalStaffRole(HospitalStaffRole.ADMIN);
+
+// Operational decisions: RECEPTIONIST is read-only.
+const requireResponder = requireHospitalStaffRole(
+  HospitalStaffRole.ADMIN,
+  HospitalStaffRole.DISPATCHER,
+  HospitalStaffRole.CLINICAL_COORDINATOR,
+);
 
 hospitalRouter.get('/me', getOwnHospital);
 hospitalRouter.get('/me/staff', requireHospitalAdmin, listStaff);
@@ -48,4 +67,20 @@ hospitalRouter.post(
   '/me/ambulances/:ambulanceId/status',
   requireHospitalAdmin,
   changeAmbulanceStatus,
+);
+
+// Hospital responses: any active staff may read; RECEPTIONIST may not decide.
+hospitalRouter.get('/me/responses', listResponses);
+hospitalRouter.get('/me/responses/:responseId', getResponse);
+hospitalRouter.post('/me/responses/:responseId/accept', requireResponder, acceptResponse);
+hospitalRouter.post('/me/responses/:responseId/reject', requireResponder, rejectResponse);
+hospitalRouter.post('/me/responses/:responseId/reservations', requireResponder, createReservation);
+
+// Bed reservations: any active staff may read; RECEPTIONIST may not reserve or release.
+hospitalRouter.get('/me/reservations', listReservations);
+hospitalRouter.get('/me/reservations/:reservationId', getReservation);
+hospitalRouter.post(
+  '/me/reservations/:reservationId/release',
+  requireResponder,
+  releaseReservation,
 );
