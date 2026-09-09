@@ -40,7 +40,7 @@ export interface SafeHospitalResponse {
 
 type ResponseWithEmergency = HospitalResponse & { emergency: EmergencyRequest };
 
-const toSafeEmergency = (emergency: EmergencyRequest): SafeEmergencySummary => ({
+export const toSafeEmergency = (emergency: EmergencyRequest): SafeEmergencySummary => ({
   id: emergency.id,
   requestType: emergency.requestType,
   severity: emergency.severity,

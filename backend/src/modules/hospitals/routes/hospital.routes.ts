@@ -32,6 +32,11 @@ import {
   listReservations,
   releaseReservation,
 } from '../controllers/bed-reservation.controller.js';
+import {
+  createHospitalAssignment,
+  getHospitalAssignment,
+  listHospitalAssignments,
+} from '../../dispatch/index.js';
 
 export const hospitalRouter = Router();
 
@@ -83,4 +88,13 @@ hospitalRouter.post(
   '/me/reservations/:reservationId/release',
   requireResponder,
   releaseReservation,
+);
+
+// Ambulance assignments (Task 1.16): any active staff may read; RECEPTIONIST may not dispatch.
+hospitalRouter.get('/me/assignments', listHospitalAssignments);
+hospitalRouter.get('/me/assignments/:assignmentId', getHospitalAssignment);
+hospitalRouter.post(
+  '/me/emergencies/:emergencyId/assignments',
+  requireResponder,
+  createHospitalAssignment,
 );
