@@ -3,6 +3,7 @@ import { correlationIdMiddleware } from './common/middleware/correlation-id.midd
 import { errorHandler } from './common/middleware/error-handler.middleware.js';
 import { authRouter } from './modules/auth/index.js';
 import { patientRouter } from './modules/patients/index.js';
+import { patientEmergencyRouter } from './modules/emergencies/index.js';
 import { adminRouter } from './modules/admin/index.js';
 import { driverRegistrationRouter, driverRouter } from './modules/drivers/index.js';
 import { hospitalRouter } from './modules/hospitals/index.js';
@@ -14,6 +15,10 @@ app.use(correlationIdMiddleware);
 app.use(express.json({ limit: '1mb' }));
 app.use('/api/v1/auth', authRouter);
 app.use('/api/v1/auth', driverRegistrationRouter);
+// Emergency routes are mounted first so their ACTIVE-only guard applies to
+// /me/emergencies; every other /api/v1/patients path falls through to the
+// onboarding router below, which still admits PENDING patients.
+app.use('/api/v1/patients', patientEmergencyRouter);
 app.use('/api/v1/patients', patientRouter);
 app.use('/api/v1/drivers', driverRouter);
 app.use('/api/v1/hospitals', hospitalRouter);
