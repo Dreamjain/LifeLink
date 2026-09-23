@@ -11,6 +11,7 @@ const envSchema = z.object({
   JWT_AUDIENCE: z.string().default('lifelink-clients'),
   JWT_EXPIRES_IN: z.string().default('15m'),
   BCRYPT_ROUNDS: z.coerce.number().int().min(10).max(16).default(12),
+  HOSPITAL_MATCH_MAX_OFFERS: z.coerce.number().int().min(1).max(20).default(3),
 });
 
 export const env = envSchema.parse(process.env);

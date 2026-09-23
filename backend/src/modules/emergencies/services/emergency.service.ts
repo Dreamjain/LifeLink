@@ -3,6 +3,8 @@ import type { EmergencyRequest } from '@prisma/client';
 import { prisma } from '../../../database/prisma.js';
 import { AppError } from '../../../common/errors/app-error.js';
 import { transitionEmergency } from '../../hospitals/services/emergency-status.service.js';
+import { matchEmergencyToHospitals } from '../../hospitals/services/hospital-matching.service.js';
+import { logger } from '../../../config/logger.js';
 import type { CreateEmergencyInput } from '../schemas/emergency.schema.js';
 import type { PatientContext } from '../types/emergency.types.js';
 
@@ -171,7 +173,22 @@ export const createOwnEmergency = async (
       return created;
     });
 
-    return { emergency: toSafePatientEmergency(emergency), idempotentReplay: false };
+    // Matching runs only after the emergency creation transaction commits. A valid SOS is
+    // never rolled back because matching finds zero hospitals or has a later infrastructure
+    // failure; the matching service itself makes offers and transitions atomically.
+    try {
+      await matchEmergencyToHospitals(emergency.id);
+    } catch (matchingError) {
+      logger.error(
+        { err: matchingError, emergencyId: emergency.id, action: 'hospital-matching' },
+        'hospital.matching.failed_after_emergency_creation',
+      );
+    }
+
+    const current = await prisma.emergencyRequest.findUniqueOrThrow({
+      where: { id: emergency.id },
+    });
+    return { emergency: toSafePatientEmergency(current), idempotentReplay: false };
   } catch (error) {
     if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
       // The namespaced key already contains the profile id; scoping the lookup by

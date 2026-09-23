@@ -15,7 +15,8 @@
     "prisma:validate": "prisma validate --schema prisma/schema.prisma",
     "prisma:generate": "prisma generate --schema prisma/schema.prisma",
     "test": "vitest run",
-    "seed:admin": "tsx prisma/seed-admin.ts"
+    "seed:admin": "tsx prisma/seed-admin.ts",
+    "smoke:task-1-18": "tsx scripts/task-1-18-smoke.ts"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

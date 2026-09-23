@@ -5,11 +5,12 @@ export interface EmergencyTransitionInput {
   emergencyId: string;
   from: EmergencyStatus;
   to: EmergencyStatus;
-  actorUserId: string;
+  actorUserId?: string;
   reason?: string;
   /**
-   * Who performed the transition. Defaults to HOSPITAL_STAFF so every Task 1.15/1.16
-   * call site keeps its existing behaviour unchanged.
+   * Who performed the transition. System transitions intentionally omit actorUserId.
+   * The actor type defaults to HOSPITAL_STAFF so every Task 1.15/1.16 call site keeps
+   * its existing behaviour unchanged.
    */
   actorType?: TransitionActorType;
   /**

@@ -7,8 +7,9 @@ import {
   UserRole,
   UserStatus,
 } from '@prisma/client';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { prisma } from '../../../database/prisma.js';
+import { matchEmergencyToHospitals } from '../../hospitals/services/hospital-matching.service.js';
 import { MAX_CLIENT_IDEMPOTENCY_KEY_LENGTH } from '../schemas/emergency.schema.js';
 import {
   cancelOwnEmergency,
@@ -18,6 +19,24 @@ import {
   namespaceIdempotencyKey,
   resolvePatientContext,
 } from './emergency.service.js';
+
+/**
+ * Task 1.18 integrates hospital matching into SOS creation, and matching scans every eligible
+ * hospital in the database. This suite owns Task 1.17 semantics and deliberately creates no
+ * hospital fixtures, so matching is stubbed here: the assertions below must not depend on
+ * whether another suite happens to have an eligible hospital in the shared test database.
+ *
+ * The real SOS -> matching integration is covered against controlled fixtures in
+ * hospitals/services/hospital-matching.service.test.ts.
+ */
+vi.mock('../../hospitals/services/hospital-matching.service.js', () => ({
+  matchEmergencyToHospitals: vi.fn(async (emergencyId: string) => ({
+    emergencyId,
+    matched: false,
+    hospitalCount: 0,
+    idempotentReplay: false,
+  })),
+}));
 
 const TEST_PHONE_PREFIX = '+1717';
 
@@ -192,6 +211,32 @@ describe('createOwnEmergency', () => {
     expect(await prisma.emergencyRequest.count({ where: { patientId: patient.profile.id } })).toBe(
       2,
     );
+  });
+  it('runs hospital matching exactly once for a newly created emergency', async () => {
+    const patient = await createPatient();
+    vi.mocked(matchEmergencyToHospitals).mockClear();
+
+    const result = await createOwnEmergency(patient.userId, {}, randomKey());
+
+    expect(matchEmergencyToHospitals).toHaveBeenCalledTimes(1);
+    expect(matchEmergencyToHospitals).toHaveBeenCalledWith(result.emergency.id);
+  });
+
+  it('keeps a valid SOS when hospital matching fails', async () => {
+    const patient = await createPatient();
+    vi.mocked(matchEmergencyToHospitals).mockRejectedValueOnce(new Error('matching unavailable'));
+
+    const result = await createOwnEmergency(patient.userId, {}, randomKey());
+
+    // Matching runs after the creation transaction commits, so its failure must not roll
+    // back the emergency or its opening history row.
+    expect(result.emergency.currentStatus).toBe(EmergencyStatus.CREATED);
+    expect(await prisma.emergencyRequest.count({ where: { patientId: patient.profile.id } })).toBe(
+      1,
+    );
+    expect(
+      await prisma.emergencyStatusHistory.count({ where: { emergencyId: result.emergency.id } }),
+    ).toBe(1);
   });
 });
 

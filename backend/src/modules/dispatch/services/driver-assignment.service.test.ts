@@ -153,41 +153,70 @@ const seedOffer = async () => {
 };
 
 afterAll(async () => {
+  // Fixtures are resolved from this file's own prefixes only.
+  //
+  // Emergencies are discovered from this file's own patients, never from hospital responses
+  // alone. Task 1.18 matching scans every eligible hospital, so another suite's emergency can
+  // legitimately hold an offer against this suite's hospital; deleting that emergency here
+  // would corrupt the other suite and can strand a PatientProfile whose User is then deleted
+  // (PatientProfile_userId_fkey RESTRICT).
   const hospitals = await prisma.hospital.findMany({
     where: { registrationNumber: { startsWith: TEST_REG_PREFIX } },
     select: { id: true },
   });
-  const hospitalIds = hospitals.map((h) => h.id);
+  const hospitalIds = hospitals.map((hospital) => hospital.id);
 
-  const responses = await prisma.hospitalResponse.findMany({
+  const users = await prisma.user.findMany({
+    where: { phone: { startsWith: TEST_PHONE_PREFIX } },
+    select: { id: true, patientProfile: { select: { id: true } } },
+  });
+  const userIds = users.map((user) => user.id);
+  const profileIds = users.flatMap((user) => (user.patientProfile ? [user.patientProfile.id] : []));
+
+  // 1. Detach every response pointing at this file's hospitals — including offers Task 1.18
+  //    matching created for another suite's emergency — without touching those emergencies.
+  const ownHospitalResponses = await prisma.hospitalResponse.findMany({
     where: { hospitalId: { in: hospitalIds } },
-    select: { id: true, emergencyId: true },
+    select: { id: true },
   });
-  const emergencyIds = [...new Set(responses.map((r) => r.emergencyId))];
+  const ownHospitalResponseIds = ownHospitalResponses.map((response) => response.id);
+  await prisma.bedReservation.deleteMany({
+    where: { hospitalResponseId: { in: ownHospitalResponseIds } },
+  });
+  await prisma.ambulanceAssignment.deleteMany({
+    where: { hospitalResponseId: { in: ownHospitalResponseIds } },
+  });
+  await prisma.hospitalResponse.deleteMany({ where: { id: { in: ownHospitalResponseIds } } });
 
-  await prisma.ambulanceAssignment.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
-  await prisma.emergencyStatusHistory.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
-  await prisma.hospitalResponse.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
-
+  // 2. Tear this file's own patients' emergencies down completely, whichever hospitals they
+  //    were offered to.
   const emergencies = await prisma.emergencyRequest.findMany({
-    where: { id: { in: emergencyIds } },
-    select: { patientId: true },
+    where: { patientId: { in: profileIds } },
+    select: { id: true },
   });
+  const emergencyIds = emergencies.map((emergency) => emergency.id);
+  await prisma.ambulanceAssignment.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
+  await prisma.bedReservation.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
+  await prisma.doctorAssignment.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
+  await prisma.notification.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
+  await prisma.emergencyStatusHistory.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
+  await prisma.hospitalResponse.deleteMany({ where: { emergencyId: { in: emergencyIds } } });
   await prisma.emergencyRequest.deleteMany({ where: { id: { in: emergencyIds } } });
 
-  const patientIds = emergencies.map((e) => e.patientId);
-  const profiles = await prisma.patientProfile.findMany({
-    where: { id: { in: patientIds } },
-    select: { userId: true },
-  });
-  await prisma.patientProfile.deleteMany({ where: { id: { in: patientIds } } });
-  await prisma.user.deleteMany({ where: { id: { in: profiles.map((p) => p.userId) } } });
-  await prisma.ambulance.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
-  await prisma.hospital.deleteMany({ where: { id: { in: hospitalIds } } });
+  // 3. Rows referencing this file's users directly must go before the users do.
+  await prisma.emergencyStatusHistory.deleteMany({ where: { actorUserId: { in: userIds } } });
+  await prisma.notification.deleteMany({ where: { recipientUserId: { in: userIds } } });
+  await prisma.patientProfile.deleteMany({ where: { id: { in: profileIds } } });
   await prisma.driverProfile.deleteMany({
     where: { licenceNumber: { startsWith: TEST_LICENCE_PREFIX } },
   });
-  await prisma.user.deleteMany({ where: { phone: { startsWith: TEST_PHONE_PREFIX } } });
+
+  // 4. Hospital-owned resources, then the hospitals and users themselves.
+  await prisma.bed.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
+  await prisma.ambulance.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
+  await prisma.hospitalStaffMembership.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
+  await prisma.hospital.deleteMany({ where: { id: { in: hospitalIds } } });
+  await prisma.user.deleteMany({ where: { id: { in: userIds } } });
 });
 
 describe('resolveDriverContext', () => {

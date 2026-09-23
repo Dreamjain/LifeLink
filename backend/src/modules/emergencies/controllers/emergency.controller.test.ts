@@ -11,6 +11,24 @@ import {
   listEmergencies,
 } from './emergency.controller.js';
 
+/**
+ * Task 1.18 integrates hospital matching into SOS creation, and matching scans every eligible
+ * hospital in the database. This suite owns Task 1.17 semantics and deliberately creates no
+ * hospital fixtures, so matching is stubbed here: the assertions below must not depend on
+ * whether another suite happens to have an eligible hospital in the shared test database.
+ *
+ * The real SOS -> matching integration is covered against controlled fixtures in
+ * hospitals/services/hospital-matching.service.test.ts.
+ */
+vi.mock('../../hospitals/services/hospital-matching.service.js', () => ({
+  matchEmergencyToHospitals: vi.fn(async (emergencyId: string) => ({
+    emergencyId,
+    matched: false,
+    hospitalCount: 0,
+    idempotentReplay: false,
+  })),
+}));
+
 const TEST_PHONE_PREFIX = '+1718';
 const PASSWORD = 'a-very-strong-passphrase';
 
