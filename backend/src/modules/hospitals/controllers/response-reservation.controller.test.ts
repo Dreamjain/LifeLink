@@ -215,6 +215,25 @@ afterAll(async () => {
   await prisma.bed.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
   await prisma.ambulance.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
   await prisma.hospitalStaffMembership.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
+
+  // 5. Sweep offers once more, immediately before the delete.
+  //
+  //    Step 1 ran many statements ago, and these hospitals stayed matchable the whole time:
+  //    Task 1.18 matching is global, so a suite still running in another worker can attach a
+  //    brand-new offer to one of them inside that window and the hospital delete then fails on
+  //    HospitalResponse_hospitalId_fkey. The bed delete above has just made them ineligible
+  //    (no AVAILABLE bed, so no new offer can be created), and these relation-filtered deletes
+  //    have no find-then-delete gap of their own, which closes the window.
+  //
+  //    Only the offers are removed — the foreign emergencies behind them are left untouched.
+  await prisma.bedReservation.deleteMany({
+    where: { hospitalResponse: { hospitalId: { in: hospitalIds } } },
+  });
+  await prisma.ambulanceAssignment.deleteMany({
+    where: { hospitalResponse: { hospitalId: { in: hospitalIds } } },
+  });
+  await prisma.hospitalResponse.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
+
   await prisma.hospital.deleteMany({ where: { id: { in: hospitalIds } } });
   await prisma.user.deleteMany({ where: { id: { in: userIds } } });
 });

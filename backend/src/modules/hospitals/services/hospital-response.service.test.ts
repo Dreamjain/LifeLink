@@ -321,10 +321,195 @@ describe('competing acceptance race', () => {
     });
     expect(emergency.currentStatus).toBe(EmergencyStatus.HOSPITAL_ACCEPTED);
 
+    // Task 1.19: the losing offer is withdrawn by the winner's transaction, never left
+    // PENDING and never rejected.
+    const all = await prisma.hospitalResponse.findMany({
+      where: { emergencyId: seedA.emergency.id },
+    });
+    expect(all).toHaveLength(2);
+    const loser = all.find((entry) => entry.status !== HospitalResponseStatus.ACCEPTED);
+    expect(loser?.status).toBe(HospitalResponseStatus.WITHDRAWN);
+    expect(loser?.responseByUserId).toBeNull();
+    expect(loser?.respondedAt).toBeNull();
+    expect(loser?.rejectionReason).toBeNull();
+
     const history = await prisma.emergencyStatusHistory.findMany({
       where: { emergencyId: seedA.emergency.id },
     });
     expect(history).toHaveLength(1);
+  });
+});
+
+describe('competing offer withdrawal', () => {
+  /** Adds another hospital's offer for the same emergency. */
+  const addSiblingOffer = async (
+    emergencyId: string,
+    hospitalId: string,
+    status: HospitalResponseStatus = HospitalResponseStatus.PENDING,
+  ) =>
+    prisma.hospitalResponse.create({
+      data: {
+        emergencyId,
+        hospitalId,
+        status,
+        ...(status === HospitalResponseStatus.REJECTED
+          ? { rejectionReason: 'No ICU capacity.', respondedAt: new Date() }
+          : {}),
+      },
+    });
+
+  it('withdraws every sibling PENDING offer and keeps the accepted one ACCEPTED', async () => {
+    const winner = await createScope();
+    const loserOne = await createScope();
+    const loserTwo = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedEmergency({ hospitalId: winner.hospitalId });
+    const siblingOne = await addSiblingOffer(seed.emergency.id, loserOne.hospitalId);
+    const siblingTwo = await addSiblingOffer(seed.emergency.id, loserTwo.hospitalId);
+
+    const accepted = await acceptResponse(winner, seed.response.id, actorUserId);
+
+    expect(accepted.status).toBe(HospitalResponseStatus.ACCEPTED);
+    const stored = await prisma.hospitalResponse.findUniqueOrThrow({
+      where: { id: seed.response.id },
+    });
+    expect(stored.status).toBe(HospitalResponseStatus.ACCEPTED);
+    expect(stored.responseByUserId).toBe(actorUserId);
+
+    for (const siblingId of [siblingOne.id, siblingTwo.id]) {
+      const sibling = await prisma.hospitalResponse.findUniqueOrThrow({
+        where: { id: siblingId },
+      });
+      expect(sibling.status).toBe(HospitalResponseStatus.WITHDRAWN);
+      // Nobody at those hospitals decided anything, so no decision metadata is written.
+      expect(sibling.responseByUserId).toBeNull();
+      expect(sibling.respondedAt).toBeNull();
+      expect(sibling.rejectionReason).toBeNull();
+    }
+  });
+
+  it('leaves an already REJECTED sibling REJECTED with its reason intact', async () => {
+    const winner = await createScope();
+    const rejecter = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedEmergency({ hospitalId: winner.hospitalId });
+    const rejected = await addSiblingOffer(
+      seed.emergency.id,
+      rejecter.hospitalId,
+      HospitalResponseStatus.REJECTED,
+    );
+
+    await acceptResponse(winner, seed.response.id, actorUserId);
+
+    const stored = await prisma.hospitalResponse.findUniqueOrThrow({ where: { id: rejected.id } });
+    expect(stored.status).toBe(HospitalResponseStatus.REJECTED);
+    expect(stored.rejectionReason).toBe('No ICU capacity.');
+    expect(stored.respondedAt).not.toBeNull();
+  });
+
+  it('leaves an already WITHDRAWN sibling WITHDRAWN', async () => {
+    const winner = await createScope();
+    const other = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedEmergency({ hospitalId: winner.hospitalId });
+    const withdrawn = await addSiblingOffer(
+      seed.emergency.id,
+      other.hospitalId,
+      HospitalResponseStatus.WITHDRAWN,
+    );
+
+    await acceptResponse(winner, seed.response.id, actorUserId);
+
+    expect(
+      (await prisma.hospitalResponse.findUniqueOrThrow({ where: { id: withdrawn.id } })).status,
+    ).toBe(HospitalResponseStatus.WITHDRAWN);
+  });
+
+  it('does not touch a PENDING offer belonging to a different emergency', async () => {
+    const winner = await createScope();
+    const bystander = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedEmergency({ hospitalId: winner.hospitalId });
+    const otherEmergency = await seedEmergency({ hospitalId: bystander.hospitalId });
+
+    await acceptResponse(winner, seed.response.id, actorUserId);
+
+    const untouched = await prisma.hospitalResponse.findUniqueOrThrow({
+      where: { id: otherEmergency.response.id },
+    });
+    expect(untouched.status).toBe(HospitalResponseStatus.PENDING);
+    expect(
+      await prisma.emergencyRequest.findUniqueOrThrow({
+        where: { id: otherEmergency.emergency.id },
+      }),
+    ).toMatchObject({ currentStatus: EmergencyStatus.PENDING_HOSPITAL_RESPONSE });
+  });
+
+  it('writes exactly one history row for the acceptance and none for the withdrawals', async () => {
+    const winner = await createScope();
+    const loserOne = await createScope();
+    const loserTwo = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedEmergency({ hospitalId: winner.hospitalId });
+    await addSiblingOffer(seed.emergency.id, loserOne.hospitalId);
+    await addSiblingOffer(seed.emergency.id, loserTwo.hospitalId);
+
+    await acceptResponse(winner, seed.response.id, actorUserId);
+
+    const history = await prisma.emergencyStatusHistory.findMany({
+      where: { emergencyId: seed.emergency.id },
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({
+      fromStatus: EmergencyStatus.PENDING_HOSPITAL_RESPONSE,
+      toStatus: EmergencyStatus.HOSPITAL_ACCEPTED,
+      actorUserId,
+      actorType: 'HOSPITAL_STAFF',
+    });
+  });
+
+  it('rolls the whole acceptance back when the emergency transition fails', async () => {
+    const winner = await createScope();
+    const loser = await createScope();
+    const actorUserId = await createActor();
+    // The emergency has already left PENDING_HOSPITAL_RESPONSE, so the transition must fail.
+    const seed = await seedEmergency({
+      hospitalId: winner.hospitalId,
+      emergencyStatus: EmergencyStatus.HOSPITAL_ACCEPTED,
+    });
+    const sibling = await addSiblingOffer(seed.emergency.id, loser.hospitalId);
+
+    await expect(acceptResponse(winner, seed.response.id, actorUserId)).rejects.toMatchObject({
+      code: 'EMERGENCY_STATUS_CONFLICT',
+    });
+
+    expect(
+      (await prisma.hospitalResponse.findUniqueOrThrow({ where: { id: seed.response.id } })).status,
+    ).toBe(HospitalResponseStatus.PENDING);
+    expect(
+      (await prisma.hospitalResponse.findUniqueOrThrow({ where: { id: sibling.id } })).status,
+    ).toBe(HospitalResponseStatus.PENDING);
+    expect(
+      await prisma.emergencyStatusHistory.count({ where: { emergencyId: seed.emergency.id } }),
+    ).toBe(0);
+  });
+
+  it('refuses to accept or reject a withdrawn offer afterwards', async () => {
+    const winner = await createScope();
+    const loser = await createScope();
+    const actorUserId = await createActor();
+    const loserActorUserId = await createActor();
+    const seed = await seedEmergency({ hospitalId: winner.hospitalId });
+    const sibling = await addSiblingOffer(seed.emergency.id, loser.hospitalId);
+
+    await acceptResponse(winner, seed.response.id, actorUserId);
+
+    await expect(acceptResponse(loser, sibling.id, loserActorUserId)).rejects.toMatchObject({
+      code: 'HOSPITAL_RESPONSE_STATUS_CONFLICT',
+    });
+    await expect(
+      rejectResponse(loser, sibling.id, loserActorUserId, 'Changed our mind.'),
+    ).rejects.toMatchObject({ code: 'HOSPITAL_RESPONSE_STATUS_CONFLICT' });
   });
 });
 
@@ -360,18 +545,20 @@ describe('rejectResponse', () => {
     expect(history).toHaveLength(0);
   });
 
-  it.each([HospitalResponseStatus.ACCEPTED, HospitalResponseStatus.REJECTED])(
-    'refuses to reject a %s response',
-    async (responseStatus) => {
-      const scope = await createScope();
-      const actorUserId = await createActor();
-      const seed = await seedEmergency({ hospitalId: scope.hospitalId, responseStatus });
+  it.each([
+    HospitalResponseStatus.ACCEPTED,
+    HospitalResponseStatus.REJECTED,
+    HospitalResponseStatus.EXPIRED,
+    HospitalResponseStatus.WITHDRAWN,
+  ])('refuses to reject a %s response', async (responseStatus) => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedEmergency({ hospitalId: scope.hospitalId, responseStatus });
 
-      await expect(
-        rejectResponse(scope, seed.response.id, actorUserId, 'Too late.'),
-      ).rejects.toMatchObject({ code: 'HOSPITAL_RESPONSE_STATUS_CONFLICT' });
-    },
-  );
+    await expect(
+      rejectResponse(scope, seed.response.id, actorUserId, 'Too late.'),
+    ).rejects.toMatchObject({ code: 'HOSPITAL_RESPONSE_STATUS_CONFLICT' });
+  });
 
   it('cannot reject another hospital response', async () => {
     const scopeA = await createScope();

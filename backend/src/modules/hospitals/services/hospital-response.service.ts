@@ -157,6 +157,27 @@ export const acceptResponse = async (
       );
     }
 
+    // The emergency is now committed to this hospital, so every other offer still awaiting an
+    // answer is withdrawn by the system in this same transaction: a losing hospital must not
+    // keep a live offer for an emergency that is already placed.
+    //
+    // The update is conditional on PENDING, so a hospital that already rejected — or that was
+    // already withdrawn — is never overwritten, and it excludes the accepted response itself.
+    // responseByUserId, rejectionReason and respondedAt are deliberately left null: nobody at
+    // those hospitals made a decision, and the withdrawal is not their rejection.
+    //
+    // No EmergencyStatusHistory row is written here. That table records EmergencyRequest
+    // transitions, and the emergency makes exactly one transition during an acceptance; the
+    // HospitalResponse rows are themselves the audit trail for each offer's outcome.
+    await tx.hospitalResponse.updateMany({
+      where: {
+        emergencyId: response.emergencyId,
+        id: { not: responseId },
+        status: HospitalResponseStatus.PENDING,
+      },
+      data: { status: HospitalResponseStatus.WITHDRAWN },
+    });
+
     return toSafeResponse(
       await tx.hospitalResponse.findUniqueOrThrow({
         where: { id: responseId },

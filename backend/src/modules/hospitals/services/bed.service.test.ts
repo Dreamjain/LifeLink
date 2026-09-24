@@ -44,6 +44,23 @@ afterAll(async () => {
   });
   const hospitalIds = hospitals.map((h) => h.id);
 
+  // Task 1.18 matching is global, so an emergency owned by another suite can legitimately
+  // hold an offer against a hospital created here. Detach those offers — and anything hanging
+  // off them — so these hospitals can be deleted, while leaving the foreign emergencies
+  // themselves completely untouched.
+  const ownHospitalResponses = await prisma.hospitalResponse.findMany({
+    where: { hospitalId: { in: hospitalIds } },
+    select: { id: true },
+  });
+  const ownHospitalResponseIds = ownHospitalResponses.map((response) => response.id);
+  await prisma.bedReservation.deleteMany({
+    where: { hospitalResponseId: { in: ownHospitalResponseIds } },
+  });
+  await prisma.ambulanceAssignment.deleteMany({
+    where: { hospitalResponseId: { in: ownHospitalResponseIds } },
+  });
+  await prisma.hospitalResponse.deleteMany({ where: { id: { in: ownHospitalResponseIds } } });
+
   await prisma.bed.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
   await prisma.hospital.deleteMany({ where: { id: { in: hospitalIds } } });
 });
