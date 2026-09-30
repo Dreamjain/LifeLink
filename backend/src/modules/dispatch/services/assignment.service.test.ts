@@ -15,7 +15,12 @@ import {
 import { afterAll, describe, expect, it } from 'vitest';
 import { prisma } from '../../../database/prisma.js';
 import type { HospitalStaffContext } from '../../hospitals/types/hospital.types.js';
-import { createAssignment, getAssignment, listAssignments } from './assignment.service.js';
+import {
+  autoAssignAmbulanceForReservedEmergency,
+  createAssignment,
+  getAssignment,
+  listAssignments,
+} from './assignment.service.js';
 
 const TEST_REG_PREFIX = 'T1616-';
 const TEST_PHONE_PREFIX = '+1616';
@@ -164,6 +169,17 @@ afterAll(async () => {
   const userIds = users.map((user) => user.id);
   const profileIds = users.flatMap((user) => (user.patientProfile ? [user.patientProfile.id] : []));
 
+  const ownDrivers = await prisma.driverProfile.findMany({
+    where: { licenceNumber: { startsWith: TEST_LICENCE_PREFIX } },
+    select: { id: true },
+  });
+  const ownDriverIds = ownDrivers.map((driver) => driver.id);
+  const ownAmbulances = await prisma.ambulance.findMany({
+    where: { hospitalId: { in: hospitalIds } },
+    select: { id: true },
+  });
+  const ownAmbulanceIds = ownAmbulances.map((ambulance) => ambulance.id);
+
   // 1. Detach every response pointing at this file's hospitals — including offers Task 1.18
   //    matching created for another suite's emergency — without touching those emergencies.
   const ownHospitalResponses = await prisma.hospitalResponse.findMany({
@@ -198,9 +214,13 @@ afterAll(async () => {
   await prisma.emergencyStatusHistory.deleteMany({ where: { actorUserId: { in: userIds } } });
   await prisma.notification.deleteMany({ where: { recipientUserId: { in: userIds } } });
   await prisma.patientProfile.deleteMany({ where: { id: { in: profileIds } } });
-  await prisma.driverProfile.deleteMany({
-    where: { licenceNumber: { startsWith: TEST_LICENCE_PREFIX } },
-  });
+
+  // Task 1.21: an assignment can reach this file's resources from outside its own emergencies,
+  // because the driver pool is global. AmbulanceAssignment references both the driver and the
+  // vehicle with onDelete: Restrict, so detach by resource id before releasing either.
+  await prisma.ambulanceAssignment.deleteMany({ where: { driverId: { in: ownDriverIds } } });
+  await prisma.ambulanceAssignment.deleteMany({ where: { ambulanceId: { in: ownAmbulanceIds } } });
+  await prisma.driverProfile.deleteMany({ where: { id: { in: ownDriverIds } } });
 
   // 4. Hospital-owned resources, then the hospitals and users themselves.
   await prisma.bed.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
@@ -677,4 +697,398 @@ describe('listAssignments / getAssignment', () => {
       statusCode: 404,
     });
   });
+});
+
+describe('autoAssignAmbulanceForReservedEmergency', () => {
+  /**
+   * Ambulances are hospital-owned, so "oldest AVAILABLE" is a local ordering this file
+   * controls outright. The DRIVER POOL IS GLOBAL by design (DatabaseDesign.md sections 11
+   * and 12.3), so every driver this file expects to be chosen is dated decades into the past:
+   * that makes it the oldest eligible row in the whole database, which both makes selection
+   * deterministic and guarantees this suite can never claim a driver owned by another suite.
+   */
+  const yearsAgo = (years: number): Date => new Date(Date.UTC(2000 - years, 0, 1, 0, 0, 0, 0));
+
+  const createAgedAmbulance = async (
+    hospitalId: string,
+    minutesOld: number,
+    status: AmbulanceStatus = AmbulanceStatus.AVAILABLE,
+  ) =>
+    prisma.ambulance.create({
+      data: {
+        hospitalId,
+        vehicleNumber: `V-${randomUUID().slice(0, 10)}`,
+        status,
+        createdAt: new Date(Date.now() - minutesOld * 60_000),
+      },
+    });
+
+  interface IneligibleDriverOptions {
+    verificationStatus?: VerificationStatus;
+    availabilityStatus?: DriverAvailability;
+    userStatus?: UserStatus;
+  }
+
+  const createAgedDriver = async (createdAt: Date, options: IneligibleDriverOptions = {}) => {
+    const user = await prisma.user.create({
+      data: {
+        phone: randomTestPhone(),
+        passwordHash: 'not-used-in-this-fixture',
+        role: UserRole.DRIVER,
+        status: options.userStatus ?? UserStatus.ACTIVE,
+        displayName: 'Fixture Driver',
+        driverProfile: {
+          create: {
+            licenceNumber: `${TEST_LICENCE_PREFIX}${randomUUID().slice(0, 12)}`,
+            verificationStatus: options.verificationStatus ?? VerificationStatus.VERIFIED,
+            availabilityStatus: options.availabilityStatus ?? DriverAvailability.AVAILABLE,
+            createdAt,
+          },
+        },
+      },
+      include: { driverProfile: true },
+    });
+
+    return user.driverProfile!;
+  };
+
+  it('selects the oldest available ambulance and the oldest eligible driver', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+    const oldestAmbulance = await createAgedAmbulance(scope.hospitalId, 90);
+    const newerAmbulance = await createAgedAmbulance(scope.hospitalId, 10);
+    const oldestDriver = await createAgedDriver(yearsAgo(60));
+    const newerDriver = await createAgedDriver(yearsAgo(50));
+
+    const outcome = await autoAssignAmbulanceForReservedEmergency(
+      scope,
+      seed.emergency.id,
+      actorUserId,
+    );
+
+    expect(outcome.assigned).toBe(true);
+    expect(outcome.attempts).toBe(1);
+    expect(outcome.reason).toBeUndefined();
+    expect(outcome.assignment?.ambulanceId).toBe(oldestAmbulance.id);
+    expect(outcome.assignment?.driverId).toBe(oldestDriver.id);
+    expect(outcome.assignment?.status).toBe(AmbulanceAssignmentStatus.OFFERED);
+    expect(outcome.assignment?.attemptNumber).toBe(1);
+    expect(outcome.assignment?.hospitalResponseId).toBe(seed.response.id);
+    expect(outcome.assignment?.emergencyId).toBe(seed.emergency.id);
+    expect(outcome.assignment?.respondedAt).toBeNull();
+
+    // Only the chosen pair is claimed.
+    expect(
+      (await prisma.ambulance.findUniqueOrThrow({ where: { id: oldestAmbulance.id } })).status,
+    ).toBe(AmbulanceStatus.OFFERED);
+    expect(
+      (await prisma.ambulance.findUniqueOrThrow({ where: { id: newerAmbulance.id } })).status,
+    ).toBe(AmbulanceStatus.AVAILABLE);
+    expect(
+      (await prisma.driverProfile.findUniqueOrThrow({ where: { id: oldestDriver.id } }))
+        .availabilityStatus,
+    ).toBe(DriverAvailability.BUSY);
+    expect(
+      (await prisma.driverProfile.findUniqueOrThrow({ where: { id: newerDriver.id } }))
+        .availabilityStatus,
+    ).toBe(DriverAvailability.AVAILABLE);
+
+    const emergency = await prisma.emergencyRequest.findUniqueOrThrow({
+      where: { id: seed.emergency.id },
+    });
+    expect(emergency.currentStatus).toBe(EmergencyStatus.PENDING_DRIVER_ACCEPTANCE);
+
+    const history = await prisma.emergencyStatusHistory.findMany({
+      where: { emergencyId: seed.emergency.id },
+    });
+    expect(history).toHaveLength(2);
+    const assigned = history.find((entry) => entry.toStatus === EmergencyStatus.AMBULANCE_ASSIGNED);
+    const pending = history.find(
+      (entry) => entry.toStatus === EmergencyStatus.PENDING_DRIVER_ACCEPTANCE,
+    );
+    expect(assigned).toMatchObject({
+      fromStatus: EmergencyStatus.BED_RESERVED,
+      actorUserId,
+      actorType: 'HOSPITAL_STAFF',
+    });
+    expect(pending).toMatchObject({
+      fromStatus: EmergencyStatus.AMBULANCE_ASSIGNED,
+      actorUserId,
+      actorType: 'HOSPITAL_STAFF',
+    });
+    expect(pending!.occurredAt.getTime()).toBeGreaterThanOrEqual(assigned!.occurredAt.getTime());
+  });
+
+  it.each([
+    AmbulanceStatus.OFFERED,
+    AmbulanceStatus.ASSIGNED,
+    AmbulanceStatus.EN_ROUTE,
+    AmbulanceStatus.OUT_OF_SERVICE,
+    AmbulanceStatus.INACTIVE,
+  ])('skips an older %s ambulance in favour of an available one', async (ambulanceStatus) => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+    // The ineligible vehicle is the oldest, so it would win if the status filter were missing.
+    const ineligible = await createAgedAmbulance(scope.hospitalId, 90, ambulanceStatus);
+    const available = await createAgedAmbulance(scope.hospitalId, 10);
+    await createAgedDriver(yearsAgo(60));
+
+    const outcome = await autoAssignAmbulanceForReservedEmergency(
+      scope,
+      seed.emergency.id,
+      actorUserId,
+    );
+
+    expect(outcome.assigned).toBe(true);
+    expect(outcome.assignment?.ambulanceId).toBe(available.id);
+    expect(
+      (await prisma.ambulance.findUniqueOrThrow({ where: { id: ineligible.id } })).status,
+    ).toBe(ambulanceStatus);
+  });
+
+  it('never selects an ambulance belonging to another hospital', async () => {
+    const scope = await createScope();
+    const foreign = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+    // The other hospital's vehicle is far older, so only ownership can keep it out.
+    const foreignAmbulance = await createAgedAmbulance(foreign.hospitalId, 5_000);
+    const ownAmbulance = await createAgedAmbulance(scope.hospitalId, 10);
+    await createAgedDriver(yearsAgo(60));
+
+    const outcome = await autoAssignAmbulanceForReservedEmergency(
+      scope,
+      seed.emergency.id,
+      actorUserId,
+    );
+
+    expect(outcome.assigned).toBe(true);
+    expect(outcome.assignment?.ambulanceId).toBe(ownAmbulance.id);
+    expect(
+      (await prisma.ambulance.findUniqueOrThrow({ where: { id: foreignAmbulance.id } })).status,
+    ).toBe(AmbulanceStatus.AVAILABLE);
+  });
+
+  const ineligibleDriverCases: Array<[string, IneligibleDriverOptions]> = [
+    ['unverified', { verificationStatus: VerificationStatus.PENDING }],
+    ['rejected', { verificationStatus: VerificationStatus.REJECTED }],
+    ['offline', { availabilityStatus: DriverAvailability.OFFLINE }],
+    ['busy', { availabilityStatus: DriverAvailability.BUSY }],
+    ['on break', { availabilityStatus: DriverAvailability.ON_BREAK }],
+    ['suspended-profile', { availabilityStatus: DriverAvailability.SUSPENDED }],
+    ['suspended-account', { userStatus: UserStatus.SUSPENDED }],
+    ['deactivated-account', { userStatus: UserStatus.DEACTIVATED }],
+    ['pending-account', { userStatus: UserStatus.PENDING }],
+  ];
+
+  it.each(ineligibleDriverCases)(
+    'skips an older %s driver in favour of an eligible one',
+    async (_label, driverOptions) => {
+      const scope = await createScope();
+      const actorUserId = await createActor();
+      const seed = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+      await createAgedAmbulance(scope.hospitalId, 10);
+      // The ineligible driver is older, so it would win if the eligibility filter were missing.
+      const ineligible = await createAgedDriver(yearsAgo(80), driverOptions);
+      const eligible = await createAgedDriver(yearsAgo(60));
+
+      const outcome = await autoAssignAmbulanceForReservedEmergency(
+        scope,
+        seed.emergency.id,
+        actorUserId,
+      );
+
+      expect(outcome.assigned).toBe(true);
+      expect(outcome.assignment?.driverId).toBe(eligible.id);
+      const untouched = await prisma.driverProfile.findUniqueOrThrow({
+        where: { id: ineligible.id },
+      });
+      expect(untouched.availabilityStatus).toBe(
+        driverOptions.availabilityStatus ?? DriverAvailability.AVAILABLE,
+      );
+    },
+  );
+
+  it('reports NO_AVAILABLE_AMBULANCE without claiming a driver', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+    const driver = await createAgedDriver(yearsAgo(60));
+
+    const outcome = await autoAssignAmbulanceForReservedEmergency(
+      scope,
+      seed.emergency.id,
+      actorUserId,
+    );
+
+    expect(outcome).toMatchObject({
+      assigned: false,
+      assignment: null,
+      reason: 'NO_AVAILABLE_AMBULANCE',
+      attempts: 0,
+    });
+
+    // Finding no vehicle is a normal outcome: nothing moves and nothing is recorded as failed.
+    expect(
+      (await prisma.driverProfile.findUniqueOrThrow({ where: { id: driver.id } }))
+        .availabilityStatus,
+    ).toBe(DriverAvailability.AVAILABLE);
+    expect(
+      (await prisma.emergencyRequest.findUniqueOrThrow({ where: { id: seed.emergency.id } }))
+        .currentStatus,
+    ).toBe(EmergencyStatus.BED_RESERVED);
+    expect(
+      await prisma.ambulanceAssignment.count({ where: { emergencyId: seed.emergency.id } }),
+    ).toBe(0);
+    expect(
+      await prisma.emergencyStatusHistory.count({ where: { emergencyId: seed.emergency.id } }),
+    ).toBe(0);
+  });
+
+  it('reports NO_AVAILABLE_AMBULANCE when every vehicle is busy or out of service', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+    await createAgedAmbulance(scope.hospitalId, 90, AmbulanceStatus.ASSIGNED);
+    await createAgedAmbulance(scope.hospitalId, 60, AmbulanceStatus.OUT_OF_SERVICE);
+    await createAgedDriver(yearsAgo(60));
+
+    const outcome = await autoAssignAmbulanceForReservedEmergency(
+      scope,
+      seed.emergency.id,
+      actorUserId,
+    );
+
+    expect(outcome.assigned).toBe(false);
+    expect(outcome.reason).toBe('NO_AVAILABLE_AMBULANCE');
+  });
+
+  it('propagates a status conflict and releases both resources when the emergency has moved on', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    // The emergency never reached BED_RESERVED, so createAssignment's transition must fail.
+    const seed = await seedReservedEmergency({
+      hospitalId: scope.hospitalId,
+      emergencyStatus: EmergencyStatus.HOSPITAL_ACCEPTED,
+    });
+    const ambulance = await createAgedAmbulance(scope.hospitalId, 10);
+    const driver = await createAgedDriver(yearsAgo(60));
+
+    await expect(
+      autoAssignAmbulanceForReservedEmergency(scope, seed.emergency.id, actorUserId),
+    ).rejects.toMatchObject({ code: 'EMERGENCY_STATUS_CONFLICT' });
+
+    // Not contention, so it is never retried; the rolled-back transaction released both claims.
+    expect((await prisma.ambulance.findUniqueOrThrow({ where: { id: ambulance.id } })).status).toBe(
+      AmbulanceStatus.AVAILABLE,
+    );
+    expect(
+      (await prisma.driverProfile.findUniqueOrThrow({ where: { id: driver.id } }))
+        .availabilityStatus,
+    ).toBe(DriverAvailability.AVAILABLE);
+    expect(
+      await prisma.ambulanceAssignment.count({ where: { emergencyId: seed.emergency.id } }),
+    ).toBe(0);
+    expect(
+      (await prisma.emergencyRequest.findUniqueOrThrow({ where: { id: seed.emergency.id } }))
+        .currentStatus,
+    ).toBe(EmergencyStatus.HOSPITAL_ACCEPTED);
+  });
+
+  it('propagates a missing accepted response instead of trying another pair', async () => {
+    const scope = await createScope();
+    const other = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedReservedEmergency({ hospitalId: other.hospitalId });
+    const ambulance = await createAgedAmbulance(scope.hospitalId, 10);
+    await createAgedDriver(yearsAgo(60));
+
+    await expect(
+      autoAssignAmbulanceForReservedEmergency(scope, seed.emergency.id, actorUserId),
+    ).rejects.toMatchObject({ code: 'EMERGENCY_NOT_FOUND' });
+
+    expect((await prisma.ambulance.findUniqueOrThrow({ where: { id: ambulance.id } })).status).toBe(
+      AmbulanceStatus.AVAILABLE,
+    );
+  });
+
+  it.each([1, 2, 3])(
+    'run %i: concurrent dispatches retry past contention without double-booking',
+    async () => {
+      const scope = await createScope();
+      const actorUserId = await createActor();
+      const seedOne = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+      const seedTwo = await seedReservedEmergency({ hospitalId: scope.hospitalId });
+      // Two of each, so a caller that loses the oldest pair has somewhere to retry to.
+      const ambulances = [
+        await createAgedAmbulance(scope.hospitalId, 90),
+        await createAgedAmbulance(scope.hospitalId, 60),
+      ];
+      const drivers = [await createAgedDriver(yearsAgo(70)), await createAgedDriver(yearsAgo(65))];
+      const ambulanceIds = ambulances.map((ambulance) => ambulance.id);
+      const driverIds = drivers.map((driver) => driver.id);
+
+      const outcomes = await Promise.all([
+        autoAssignAmbulanceForReservedEmergency(scope, seedOne.emergency.id, actorUserId),
+        autoAssignAmbulanceForReservedEmergency(scope, seedTwo.emergency.id, actorUserId),
+      ]);
+
+      // Asserted on the observed outcome rather than a predicted one: how many callers win
+      // depends on interleaving, but these invariants hold for every interleaving.
+      const winners = outcomes.filter((outcome) => outcome.assigned);
+      const heldAmbulanceIds = winners.map((outcome) => outcome.assignment!.ambulanceId);
+      const heldDriverIds = winners.map((outcome) => outcome.assignment!.driverId);
+
+      expect(new Set(heldAmbulanceIds).size).toBe(heldAmbulanceIds.length);
+      expect(new Set(heldDriverIds).size).toBe(heldDriverIds.length);
+      heldAmbulanceIds.forEach((id) => expect(ambulanceIds).toContain(id));
+      // Ancient fixtures make this suite's own drivers the only ones reachable here.
+      heldDriverIds.forEach((id) => expect(driverIds).toContain(id));
+      winners.forEach((outcome) => {
+        expect(outcome.attempts).toBeGreaterThanOrEqual(1);
+        expect(outcome.attempts).toBeLessThanOrEqual(3);
+        expect(outcome.reason).toBeUndefined();
+      });
+      outcomes
+        .filter((outcome) => !outcome.assigned)
+        .forEach((outcome) => {
+          expect(outcome.assignment).toBeNull();
+          expect([
+            'NO_AVAILABLE_AMBULANCE',
+            'NO_AVAILABLE_DRIVER',
+            'CONTENTION_EXHAUSTED',
+          ]).toContain(outcome.reason);
+        });
+
+      // The database agrees with what the callers were told.
+      expect(
+        await prisma.ambulanceAssignment.count({
+          where: {
+            emergencyId: { in: [seedOne.emergency.id, seedTwo.emergency.id] },
+            status: AmbulanceAssignmentStatus.OFFERED,
+          },
+        }),
+      ).toBe(winners.length);
+      expect(
+        await prisma.ambulance.count({
+          where: { id: { in: ambulanceIds }, status: AmbulanceStatus.OFFERED },
+        }),
+      ).toBe(winners.length);
+      expect(
+        await prisma.driverProfile.count({
+          where: { id: { in: driverIds }, availabilityStatus: DriverAvailability.BUSY },
+        }),
+      ).toBe(winners.length);
+      expect(
+        await prisma.emergencyRequest.count({
+          where: {
+            id: { in: [seedOne.emergency.id, seedTwo.emergency.id] },
+            currentStatus: EmergencyStatus.PENDING_DRIVER_ACCEPTANCE,
+          },
+        }),
+      ).toBe(winners.length);
+    },
+  );
 });

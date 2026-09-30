@@ -16,7 +16,7 @@ import { transitionEmergency } from '../../hospitals/services/emergency-status.s
 import {
   toSafeEmergency,
   type SafeEmergencySummary,
-} from '../../hospitals/services/hospital-response.service.js';
+} from '../../../common/projections/emergency.projection.js';
 import type { CreateAssignmentInput } from '../schemas/assignment.schema.js';
 
 /**
@@ -304,4 +304,133 @@ export const createAssignment = async (
 
     throw error;
   }
+};
+
+/**
+ * How many (ambulance, driver) pairs an automatic dispatch will try before giving up.
+ * Bounded on purpose, and bounded in TOTAL rather than per resource pool: each miss means a
+ * concurrent caller won that candidate, and an unbounded loop would let one acceptance walk
+ * an entire fleet and the whole national driver pool under heavy contention.
+ */
+const AUTO_ASSIGNMENT_MAX_ATTEMPTS = 3;
+
+export interface AutoAssignmentResult {
+  assigned: boolean;
+  assignment: SafeHospitalAssignment | null;
+  /** Why no vehicle was dispatched. Absent when `assigned` is true. */
+  reason?: 'NO_AVAILABLE_AMBULANCE' | 'NO_AVAILABLE_DRIVER' | 'CONTENTION_EXHAUSTED';
+  /** Completed `createAssignment` attempts. Zero when a pool was empty before the first try. */
+  attempts: number;
+}
+
+/**
+ * Dispatches a vehicle automatically for an emergency whose bed has just been reserved
+ * (Task 1.21).
+ *
+ * Vehicle choice is the oldest AVAILABLE ambulance belonging to the accepting hospital and
+ * nothing else: no ambulanceType matching, because no EmergencyRequest field expresses a
+ * vehicle-capability requirement. Driver choice is the oldest verified, available driver whose
+ * account is active, drawn from the global pool — DriverProfile has no hospital of its own by
+ * design (DatabaseDesign.md sections 11 and 12.3: a driver may operate different hospital-owned
+ * ambulances over time, and meets them only through AmbulanceAssignment).
+ *
+ * Both selections are only candidates. `createAssignment` below still performs the conditional
+ * AVAILABLE -> OFFERED claim on the vehicle and the AVAILABLE -> BUSY claim on the driver, and
+ * those claims remain the sole authority on who gets each resource. When a candidate is lost to a
+ * concurrent caller, only the resource that actually lost is excluded and the pair is rebuilt: a
+ * vehicle claimed in a transaction that then failed on the driver is released by the rollback, so
+ * it is still the right next choice.
+ *
+ * Every attempt reuses `createAssignment` unchanged, so the manual dispatch endpoint and this
+ * automatic path share one implementation of the domain rules, one transaction shape, one set of
+ * concurrency guarantees and one pair of emergency transitions
+ * (BED_RESERVED -> AMBULANCE_ASSIGNED -> PENDING_DRIVER_ACCEPTANCE).
+ *
+ * Finding no vehicle or no driver is a normal outcome, not an error: the caller keeps its
+ * acceptance and its bed, and the emergency stays BED_RESERVED. No FAILED assignment row is
+ * invented, no ESCALATED history is appended, and retry or escalation belongs to Task 1.24.
+ * The manual dispatch endpoint remains the recovery path.
+ */
+export const autoAssignAmbulanceForReservedEmergency = async (
+  context: HospitalStaffContext,
+  emergencyId: string,
+  actorUserId: string,
+): Promise<AutoAssignmentResult> => {
+  const lostAmbulanceIds: string[] = [];
+  const lostDriverIds: string[] = [];
+
+  for (let attempt = 1; attempt <= AUTO_ASSIGNMENT_MAX_ATTEMPTS; attempt += 1) {
+    const ambulance = await prisma.ambulance.findFirst({
+      where: {
+        hospitalId: context.hospitalId,
+        status: AmbulanceStatus.AVAILABLE,
+        ...(lostAmbulanceIds.length > 0 ? { id: { notIn: lostAmbulanceIds } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+
+    if (!ambulance) {
+      return {
+        assigned: false,
+        assignment: null,
+        reason: 'NO_AVAILABLE_AMBULANCE',
+        attempts: attempt - 1,
+      };
+    }
+
+    // The same predicate createAssignment claims on, so an ineligible driver is never offered.
+    const driver = await prisma.driverProfile.findFirst({
+      where: {
+        verificationStatus: VerificationStatus.VERIFIED,
+        availabilityStatus: DriverAvailability.AVAILABLE,
+        user: { status: UserStatus.ACTIVE },
+        ...(lostDriverIds.length > 0 ? { id: { notIn: lostDriverIds } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+
+    if (!driver) {
+      return {
+        assigned: false,
+        assignment: null,
+        reason: 'NO_AVAILABLE_DRIVER',
+        attempts: attempt - 1,
+      };
+    }
+
+    try {
+      const assignment = await createAssignment(
+        context,
+        emergencyId,
+        { ambulanceId: ambulance.id, driverId: driver.id },
+        actorUserId,
+      );
+
+      return { assigned: true, assignment, attempts: attempt };
+    } catch (error) {
+      // Only contention is retried, and only the resource that lost is excluded. Every other
+      // failure — an emergency that is not awaiting dispatch, a competing attempt number —
+      // would fail identically on the next pair, so it is surfaced to the caller instead.
+      if (error instanceof AppError && error.code === 'AMBULANCE_UNAVAILABLE') {
+        lostAmbulanceIds.push(ambulance.id);
+        continue;
+      }
+
+      if (error instanceof AppError && error.code === 'DRIVER_UNAVAILABLE') {
+        lostDriverIds.push(driver.id);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  return {
+    assigned: false,
+    assignment: null,
+    reason: 'CONTENTION_EXHAUSTED',
+    attempts: AUTO_ASSIGNMENT_MAX_ATTEMPTS,
+  };
 };

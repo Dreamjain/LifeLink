@@ -5,7 +5,7 @@ import { AppError } from '../../../common/errors/app-error.js';
 import {
   toSafeEmergency,
   type SafeEmergencySummary,
-} from '../../hospitals/services/hospital-response.service.js';
+} from '../../../common/projections/emergency.projection.js';
 import type { DriverContext } from '../types/dispatch.types.js';
 import { toSafeAssignmentAmbulance, type SafeAssignmentAmbulance } from './assignment.service.js';
 
