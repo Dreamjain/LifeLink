@@ -230,21 +230,29 @@ const run = async (): Promise<void> => {
   );
 
   const emergency = await prisma.emergencyRequest.findUniqueOrThrow({ where: { id: emergencyId } });
-  check('emergency is HOSPITAL_ACCEPTED', emergency.currentStatus === 'HOSPITAL_ACCEPTED');
+  // Task 1.20: accepting also holds a bed, so the emergency lands on BED_RESERVED, not
+  // HOSPITAL_ACCEPTED. Every hospital seeded here owns one available bed.
+  check(
+    'emergency is BED_RESERVED',
+    emergency.currentStatus === 'BED_RESERVED',
+    emergency.currentStatus,
+  );
 
   const history = await prisma.emergencyStatusHistory.findMany({
     where: { emergencyId },
     orderBy: { occurredAt: 'asc' },
   });
-  // A patient-initiated SOS that is matched and then accepted produces four rows:
+  // A patient-initiated SOS that is matched and then accepted produces five rows:
   //   [0] null -> CREATED                                (Task 1.17, actorType PATIENT)
   //   [1] CREATED -> SEARCHING_HOSPITAL                  (Task 1.18, actorType SYSTEM)
   //   [2] SEARCHING_HOSPITAL -> PENDING_HOSPITAL_RESPONSE (Task 1.18, actorType SYSTEM)
   //   [3] PENDING_HOSPITAL_RESPONSE -> HOSPITAL_ACCEPTED  (Task 1.19, actorType HOSPITAL_STAFF)
-  // Sibling withdrawals add none, so Task 1.19 contributes exactly row [3].
+  //   [4] HOSPITAL_ACCEPTED -> BED_RESERVED               (Task 1.20, actorType HOSPITAL_STAFF)
+  // Sibling withdrawals add none, so Task 1.19 still contributes exactly row [3]; row [4] is
+  // the automatic bed reservation Task 1.20 runs after the acceptance commits.
   check(
-    'the emergency has four history rows after acceptance',
-    history.length === 4,
+    'the emergency has five history rows after acceptance',
+    history.length === 5,
     `${history.length} rows`,
   );
 

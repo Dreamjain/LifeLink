@@ -161,6 +161,93 @@ export const createReservation = async (
 };
 
 /**
+ * How many available-bed candidates an automatic reservation will try before giving up.
+ * Bounded on purpose: each miss means a concurrent caller won that bed, and an unbounded
+ * loop would let one acceptance walk an entire ward under heavy contention.
+ */
+const AUTO_RESERVATION_MAX_ATTEMPTS = 3;
+
+export interface AutoReservationResult {
+  reserved: boolean;
+  reservation: SafeBedReservation | null;
+  /** Why no bed was held. Absent when `reserved` is true. */
+  reason?: 'NO_AVAILABLE_BED' | 'CONTENTION_EXHAUSTED';
+  attempts: number;
+}
+
+/**
+ * Holds capacity automatically for a hospital response that has just been accepted
+ * (Task 1.20).
+ *
+ * Bed choice is the oldest AVAILABLE bed belonging to the accepting hospital and nothing
+ * else: no bed-type matching, because no EmergencyRequest field expresses a bed-type
+ * requirement. The selected bed is only a candidate — `createReservation` below still
+ * performs the conditional AVAILABLE -> RESERVED claim, which remains the sole authority on
+ * who gets the bed. If a concurrent caller wins the candidate, the next-oldest bed is tried,
+ * up to AUTO_RESERVATION_MAX_ATTEMPTS.
+ *
+ * Every attempt reuses `createReservation` unchanged, so the manual reservation endpoint and
+ * this automatic path share one implementation of the domain rules, one transaction shape and
+ * one set of concurrency guarantees.
+ *
+ * Finding no bed at all is a normal outcome, not an error: the caller keeps its acceptance and
+ * the emergency stays HOSPITAL_ACCEPTED. No FAILED reservation row is invented, and retry or
+ * escalation belongs to a later task.
+ */
+export const autoReserveBedForAcceptedResponse = async (
+  context: HospitalStaffContext,
+  responseId: string,
+  actorUserId: string,
+): Promise<AutoReservationResult> => {
+  const triedBedIds: string[] = [];
+
+  for (let attempt = 1; attempt <= AUTO_RESERVATION_MAX_ATTEMPTS; attempt += 1) {
+    const candidate = await prisma.bed.findFirst({
+      where: {
+        hospitalId: context.hospitalId,
+        status: BedStatus.AVAILABLE,
+        ...(triedBedIds.length > 0 ? { id: { notIn: triedBedIds } } : {}),
+      },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true },
+    });
+
+    if (!candidate) {
+      return {
+        reserved: false,
+        reservation: null,
+        reason: 'NO_AVAILABLE_BED',
+        attempts: attempt - 1,
+      };
+    }
+
+    triedBedIds.push(candidate.id);
+
+    try {
+      const reservation = await createReservation(context, responseId, candidate.id, actorUserId);
+      return { reserved: true, reservation, attempts: attempt };
+    } catch (error) {
+      // BED_UNAVAILABLE means another caller claimed this candidate between selection and the
+      // conditional claim, so the next-oldest bed is worth trying. Every other failure —
+      // an unaccepted response, an emergency that already holds a reservation — would fail
+      // identically on the next bed, so it is surfaced to the caller instead.
+      if (error instanceof AppError && error.code === 'BED_UNAVAILABLE') {
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  return {
+    reserved: false,
+    reservation: null,
+    reason: 'CONTENTION_EXHAUSTED',
+    attempts: AUTO_RESERVATION_MAX_ATTEMPTS,
+  };
+};
+
+/**
  * Releases an active reservation, frees the bed, and returns the emergency to
  * HOSPITAL_ACCEPTED so another bed can be sought (DatabaseDesign.md §8).
  */

@@ -2,6 +2,8 @@ import { EmergencyStatus, HospitalResponseStatus } from '@prisma/client';
 import type { EmergencyRequest, HospitalResponse } from '@prisma/client';
 import { prisma } from '../../../database/prisma.js';
 import { AppError } from '../../../common/errors/app-error.js';
+import { logger } from '../../../config/logger.js';
+import { autoReserveBedForAcceptedResponse } from './bed-reservation.service.js';
 import type { HospitalStaffContext } from '../types/hospital.types.js';
 import { transitionEmergency } from './emergency-status.service.js';
 
@@ -114,7 +116,7 @@ export const acceptResponse = async (
   responseId: string,
   actorUserId: string,
 ): Promise<SafeHospitalResponse> => {
-  return prisma.$transaction(async (tx) => {
+  const emergencyId = await prisma.$transaction(async (tx) => {
     const response = await tx.hospitalResponse.findFirst({
       where: { id: responseId, hospitalId: context.hospitalId },
     });
@@ -178,13 +180,59 @@ export const acceptResponse = async (
       data: { status: HospitalResponseStatus.WITHDRAWN },
     });
 
-    return toSafeResponse(
-      await tx.hospitalResponse.findUniqueOrThrow({
-        where: { id: responseId },
-        include: { emergency: true },
-      }),
-    );
+    return response.emergencyId;
   });
+
+  // Task 1.20: the hospital has now committed to this patient, so capacity is held for them
+  // immediately. This runs only after the acceptance transaction above has committed, and in
+  // its own transaction, for the same reason Task 1.18 runs hospital matching after the SOS
+  // commits: a follow-up failure must never undo work that already succeeded. An acceptance
+  // is never rolled back, downgraded or withdrawn because a bed could not be held.
+  //
+  // Finding no available bed is a normal outcome and leaves the emergency at
+  // HOSPITAL_ACCEPTED; the manual reservation endpoint remains the recovery path, and retry
+  // or escalation belongs to a later task.
+  try {
+    const outcome = await autoReserveBedForAcceptedResponse(context, responseId, actorUserId);
+
+    logger.info(
+      {
+        actorUserId,
+        hospitalId: context.hospitalId,
+        responseId,
+        emergencyId,
+        reserved: outcome.reserved,
+        reservationId: outcome.reservation?.id,
+        bedId: outcome.reservation?.bedId,
+        attempts: outcome.attempts,
+        reason: outcome.reason,
+        action: 'auto-reserve-bed',
+      },
+      outcome.reserved
+        ? 'hospitals.response.accept.bed_reserved'
+        : 'hospitals.response.accept.no_bed_reserved',
+    );
+  } catch (error) {
+    logger.error(
+      {
+        err: error,
+        actorUserId,
+        hospitalId: context.hospitalId,
+        responseId,
+        emergencyId,
+        action: 'auto-reserve-bed',
+      },
+      'hospitals.response.accept.auto_reservation_failed',
+    );
+  }
+
+  // Re-read so the caller sees the emergency state the reservation may have advanced.
+  return toSafeResponse(
+    await prisma.hospitalResponse.findUniqueOrThrow({
+      where: { id: responseId },
+      include: { emergency: true },
+    }),
+  );
 };
 
 /**

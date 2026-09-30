@@ -14,6 +14,7 @@ import { afterAll, describe, expect, it } from 'vitest';
 import { prisma } from '../../../database/prisma.js';
 import type { HospitalStaffContext } from '../types/hospital.types.js';
 import {
+  autoReserveBedForAcceptedResponse,
   createReservation,
   getReservation,
   listReservations,
@@ -129,18 +130,27 @@ afterAll(async () => {
 
   // 1. Detach every response pointing at this file's hospitals — including offers Task 1.18
   //    matching created for another suite's emergency — without touching those emergencies.
-  const ownHospitalResponses = await prisma.hospitalResponse.findMany({
-    where: { hospitalId: { in: hospitalIds } },
-    select: { id: true },
-  });
-  const ownHospitalResponseIds = ownHospitalResponses.map((response) => response.id);
-  await prisma.bedReservation.deleteMany({
-    where: { hospitalResponseId: { in: ownHospitalResponseIds } },
-  });
-  await prisma.ambulanceAssignment.deleteMany({
-    where: { hospitalResponseId: { in: ownHospitalResponseIds } },
-  });
-  await prisma.hospitalResponse.deleteMany({ where: { id: { in: ownHospitalResponseIds } } });
+  //
+  //    This runs twice: here, and again immediately before the beds and hospitals are deleted.
+  //    A VERIFIED hospital with an AVAILABLE bed is globally eligible for matching, so another
+  //    suite can create a fresh offer against this file's hospitals at any moment, including
+  //    after this first pass.
+  const detachOwnHospitalResponses = async (): Promise<void> => {
+    const ownHospitalResponses = await prisma.hospitalResponse.findMany({
+      where: { hospitalId: { in: hospitalIds } },
+      select: { id: true },
+    });
+    const ownHospitalResponseIds = ownHospitalResponses.map((response) => response.id);
+    await prisma.bedReservation.deleteMany({
+      where: { hospitalResponseId: { in: ownHospitalResponseIds } },
+    });
+    await prisma.ambulanceAssignment.deleteMany({
+      where: { hospitalResponseId: { in: ownHospitalResponseIds } },
+    });
+    await prisma.hospitalResponse.deleteMany({ where: { id: { in: ownHospitalResponseIds } } });
+  };
+
+  await detachOwnHospitalResponses();
 
   // 2. Tear this file's own patients' emergencies down completely, whichever hospitals they
   //    were offered to.
@@ -162,10 +172,15 @@ afterAll(async () => {
   await prisma.notification.deleteMany({ where: { recipientUserId: { in: userIds } } });
   await prisma.patientProfile.deleteMany({ where: { id: { in: profileIds } } });
 
-  // 4. Hospital-owned resources, then the hospitals and users themselves.
-  await prisma.bed.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
+  // 4. Hospital-owned resources nothing else can point at.
   await prisma.ambulance.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
   await prisma.hospitalStaffMembership.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
+
+  // 5. Final sweep, as late as possible: an offer matching created since step 1 would
+  //    otherwise block the deletes below, because BedReservation and HospitalResponse both
+  //    reference beds and hospitals with onDelete: Restrict.
+  await detachOwnHospitalResponses();
+  await prisma.bed.deleteMany({ where: { hospitalId: { in: hospitalIds } } });
   await prisma.hospital.deleteMany({ where: { id: { in: hospitalIds } } });
   await prisma.user.deleteMany({ where: { id: { in: userIds } } });
 });
@@ -456,4 +471,247 @@ describe('listReservations / getReservation', () => {
       code: 'RESERVATION_NOT_FOUND',
     });
   });
+});
+
+describe('autoReserveBedForAcceptedResponse', () => {
+  /**
+   * Beds carry an explicit createdAt so "the oldest AVAILABLE bed" is a property of the
+   * fixture rather than a race between two inserts landing in the same millisecond.
+   */
+  const createAgedBed = async (
+    hospitalId: string,
+    minutesOld: number,
+    status: BedStatus = BedStatus.AVAILABLE,
+  ) =>
+    prisma.bed.create({
+      data: {
+        hospitalId,
+        bedCode: `B-${randomUUID().slice(0, 8)}`,
+        status,
+        createdAt: new Date(Date.now() - minutesOld * 60_000),
+      },
+    });
+
+  it('reserves the oldest AVAILABLE bed and advances the emergency', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedAcceptedEmergency({ hospitalId: scope.hospitalId });
+    const oldest = await createAgedBed(scope.hospitalId, 30);
+    const newer = await createAgedBed(scope.hospitalId, 5);
+
+    const outcome = await autoReserveBedForAcceptedResponse(scope, seed.response.id, actorUserId);
+
+    expect(outcome.reserved).toBe(true);
+    expect(outcome.attempts).toBe(1);
+    expect(outcome.reason).toBeUndefined();
+    expect(outcome.reservation?.bedId).toBe(oldest.id);
+    expect(outcome.reservation?.status).toBe(BedReservationStatus.RESERVED);
+    expect(outcome.reservation?.hospitalResponseId).toBe(seed.response.id);
+    expect(outcome.reservation?.emergencyId).toBe(seed.emergency.id);
+    // The accepting staff member is the reserver: this is their hospital's commitment,
+    // not an anonymous system action.
+    expect(outcome.reservation?.reservedByUserId).toBe(actorUserId);
+
+    expect((await prisma.bed.findUniqueOrThrow({ where: { id: oldest.id } })).status).toBe(
+      BedStatus.RESERVED,
+    );
+    expect((await prisma.bed.findUniqueOrThrow({ where: { id: newer.id } })).status).toBe(
+      BedStatus.AVAILABLE,
+    );
+
+    const emergency = await prisma.emergencyRequest.findUniqueOrThrow({
+      where: { id: seed.emergency.id },
+    });
+    expect(emergency.currentStatus).toBe(EmergencyStatus.BED_RESERVED);
+
+    const history = await prisma.emergencyStatusHistory.findMany({
+      where: { emergencyId: seed.emergency.id },
+    });
+    expect(history).toHaveLength(1);
+    expect(history[0]).toMatchObject({
+      fromStatus: EmergencyStatus.HOSPITAL_ACCEPTED,
+      toStatus: EmergencyStatus.BED_RESERVED,
+      actorUserId,
+      actorType: 'HOSPITAL_STAFF',
+    });
+  });
+
+  it('reports NO_AVAILABLE_BED without selecting anything when the hospital has no beds', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedAcceptedEmergency({ hospitalId: scope.hospitalId });
+
+    const outcome = await autoReserveBedForAcceptedResponse(scope, seed.response.id, actorUserId);
+
+    expect(outcome).toMatchObject({
+      reserved: false,
+      reservation: null,
+      reason: 'NO_AVAILABLE_BED',
+      attempts: 0,
+    });
+
+    // Finding no bed is a normal outcome: nothing moves and nothing is recorded as failed.
+    const emergency = await prisma.emergencyRequest.findUniqueOrThrow({
+      where: { id: seed.emergency.id },
+    });
+    expect(emergency.currentStatus).toBe(EmergencyStatus.HOSPITAL_ACCEPTED);
+    expect(await prisma.bedReservation.count({ where: { emergencyId: seed.emergency.id } })).toBe(
+      0,
+    );
+    expect(
+      await prisma.emergencyStatusHistory.count({ where: { emergencyId: seed.emergency.id } }),
+    ).toBe(0);
+  });
+
+  it('never considers a bed that is not AVAILABLE', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedAcceptedEmergency({ hospitalId: scope.hospitalId });
+    const unavailable = await Promise.all([
+      createAgedBed(scope.hospitalId, 30, BedStatus.RESERVED),
+      createAgedBed(scope.hospitalId, 20, BedStatus.OCCUPIED),
+      createAgedBed(scope.hospitalId, 10, BedStatus.OUT_OF_SERVICE),
+    ]);
+
+    const outcome = await autoReserveBedForAcceptedResponse(scope, seed.response.id, actorUserId);
+
+    expect(outcome.reserved).toBe(false);
+    expect(outcome.reason).toBe('NO_AVAILABLE_BED');
+
+    for (const bed of unavailable) {
+      const stored = await prisma.bed.findUniqueOrThrow({ where: { id: bed.id } });
+      expect(stored.status).toBe(bed.status);
+    }
+    expect(await prisma.bedReservation.count({ where: { emergencyId: seed.emergency.id } })).toBe(
+      0,
+    );
+  });
+
+  it('never reserves a bed belonging to another hospital', async () => {
+    const scopeA = await createScope();
+    const scopeB = await createScope();
+    const actorUserId = await createActor();
+    const seedA = await seedAcceptedEmergency({ hospitalId: scopeA.hospitalId });
+    const bedB = await createAgedBed(scopeB.hospitalId, 30);
+
+    const outcome = await autoReserveBedForAcceptedResponse(scopeA, seedA.response.id, actorUserId);
+
+    expect(outcome.reserved).toBe(false);
+    expect(outcome.reason).toBe('NO_AVAILABLE_BED');
+    expect((await prisma.bed.findUniqueOrThrow({ where: { id: bedB.id } })).status).toBe(
+      BedStatus.AVAILABLE,
+    );
+  });
+
+  it('surfaces a non-contention failure instead of walking the ward', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    // The response was never accepted, so every candidate bed would fail identically.
+    const seed = await seedAcceptedEmergency({
+      hospitalId: scope.hospitalId,
+      responseStatus: HospitalResponseStatus.PENDING,
+      emergencyStatus: EmergencyStatus.PENDING_HOSPITAL_RESPONSE,
+    });
+    const beds = await Promise.all([
+      createAgedBed(scope.hospitalId, 30),
+      createAgedBed(scope.hospitalId, 20),
+    ]);
+
+    await expect(
+      autoReserveBedForAcceptedResponse(scope, seed.response.id, actorUserId),
+    ).rejects.toMatchObject({ code: 'HOSPITAL_RESPONSE_STATUS_CONFLICT' });
+
+    for (const bed of beds) {
+      expect((await prisma.bed.findUniqueOrThrow({ where: { id: bed.id } })).status).toBe(
+        BedStatus.AVAILABLE,
+      );
+    }
+  });
+
+  it('consumes no bed when the emergency already holds a reservation', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const seed = await seedAcceptedEmergency({ hospitalId: scope.hospitalId });
+    const first = await createAgedBed(scope.hospitalId, 30);
+    const second = await createAgedBed(scope.hospitalId, 20);
+
+    const initial = await autoReserveBedForAcceptedResponse(scope, seed.response.id, actorUserId);
+    expect(initial.reservation?.bedId).toBe(first.id);
+
+    // BED_RESERVATION_CONFLICT is not contention, so it must not be retried against the
+    // next bed and must not leave a claimed-then-abandoned bed behind.
+    await expect(
+      autoReserveBedForAcceptedResponse(scope, seed.response.id, actorUserId),
+    ).rejects.toMatchObject({ code: 'BED_RESERVATION_CONFLICT' });
+
+    expect((await prisma.bed.findUniqueOrThrow({ where: { id: second.id } })).status).toBe(
+      BedStatus.AVAILABLE,
+    );
+    expect(
+      await prisma.bedReservation.count({
+        where: { emergencyId: seed.emergency.id, status: BedReservationStatus.RESERVED },
+      }),
+    ).toBe(1);
+  });
+
+  it.each([1, 2, 3])(
+    'run %i: concurrent acceptances never double-book a bed and never over-report',
+    async () => {
+      const scope = await createScope();
+      const actorUserId = await createActor();
+      const seeds = await Promise.all([
+        seedAcceptedEmergency({ hospitalId: scope.hospitalId }),
+        seedAcceptedEmergency({ hospitalId: scope.hospitalId }),
+        seedAcceptedEmergency({ hospitalId: scope.hospitalId }),
+        seedAcceptedEmergency({ hospitalId: scope.hospitalId }),
+      ]);
+      const beds = [];
+      for (let index = 0; index < seeds.length; index += 1) {
+        beds.push(await createAgedBed(scope.hospitalId, 40 - index));
+      }
+      const bedIds = beds.map((bed) => bed.id);
+
+      const outcomes = await Promise.all(
+        seeds.map((seed) =>
+          autoReserveBedForAcceptedResponse(scope, seed.response.id, actorUserId),
+        ),
+      );
+
+      // Asserted on the observed outcome rather than a predicted one: how many callers win
+      // depends on interleaving, but the invariants below hold for every interleaving.
+      const winners = outcomes.filter((outcome) => outcome.reserved);
+      const heldBedIds = winners.map((outcome) => outcome.reservation!.bedId);
+      expect(new Set(heldBedIds).size).toBe(heldBedIds.length);
+      heldBedIds.forEach((bedId) => expect(bedIds).toContain(bedId));
+      winners.forEach((outcome) => {
+        expect(outcome.attempts).toBeGreaterThanOrEqual(1);
+        expect(outcome.attempts).toBeLessThanOrEqual(3);
+        expect(outcome.reason).toBeUndefined();
+      });
+      outcomes
+        .filter((outcome) => !outcome.reserved)
+        .forEach((outcome) => {
+          expect(outcome.reservation).toBeNull();
+          expect(['NO_AVAILABLE_BED', 'CONTENTION_EXHAUSTED']).toContain(outcome.reason);
+        });
+
+      // The database agrees with what the callers were told.
+      expect(
+        await prisma.bedReservation.count({
+          where: { bedId: { in: bedIds }, status: BedReservationStatus.RESERVED },
+        }),
+      ).toBe(winners.length);
+      expect(
+        await prisma.bed.count({ where: { id: { in: bedIds }, status: BedStatus.RESERVED } }),
+      ).toBe(winners.length);
+      expect(
+        await prisma.emergencyRequest.count({
+          where: {
+            id: { in: seeds.map((seed) => seed.emergency.id) },
+            currentStatus: EmergencyStatus.BED_RESERVED,
+          },
+        }),
+      ).toBe(winners.length);
+    },
+  );
 });
