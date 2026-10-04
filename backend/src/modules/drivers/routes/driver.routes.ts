@@ -4,6 +4,8 @@ import { requireAuth, requireRole } from '../../auth/index.js';
 import { getMe, patchAvailability, registerDriver } from '../controllers/driver.controller.js';
 import {
   acceptDriverAssignment,
+  changeDriverAssignmentStatus,
+  failDriverAssignment,
   getDriverAssignment,
   listDriverAssignments,
   rejectDriverAssignment,
@@ -29,3 +31,9 @@ driverRouter.get('/me/assignments', listDriverAssignments);
 driverRouter.get('/me/assignments/:assignmentId', getDriverAssignment);
 driverRouter.post('/me/assignments/:assignmentId/accept', acceptDriverAssignment);
 driverRouter.post('/me/assignments/:assignmentId/reject', rejectDriverAssignment);
+
+// Trip lifecycle (Task 1.22). Same ownership rule: the assignment is reached only through the
+// authenticated driver's own DriverProfile, and the action names what happened on the road
+// rather than assigning a status directly.
+driverRouter.post('/me/assignments/:assignmentId/status', changeDriverAssignmentStatus);
+driverRouter.post('/me/assignments/:assignmentId/fail', failDriverAssignment);

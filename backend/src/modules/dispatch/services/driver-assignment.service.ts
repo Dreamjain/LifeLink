@@ -1,4 +1,10 @@
-import { AmbulanceAssignmentStatus, AmbulanceStatus, DriverAvailability } from '@prisma/client';
+import {
+  AmbulanceAssignmentStatus,
+  AmbulanceStatus,
+  DriverAvailability,
+  EmergencyStatus,
+  TransitionActorType,
+} from '@prisma/client';
 import type { Ambulance, AmbulanceAssignment, EmergencyRequest, Hospital } from '@prisma/client';
 import { prisma } from '../../../database/prisma.js';
 import { AppError } from '../../../common/errors/app-error.js';
@@ -6,6 +12,8 @@ import {
   toSafeEmergency,
   type SafeEmergencySummary,
 } from '../../../common/projections/emergency.projection.js';
+import { transitionEmergency } from '../../hospitals/services/emergency-status.service.js';
+import type { TripAction } from '../schemas/assignment.schema.js';
 import type { DriverContext } from '../types/dispatch.types.js';
 import { toSafeAssignmentAmbulance, type SafeAssignmentAmbulance } from './assignment.service.js';
 
@@ -270,6 +278,280 @@ export const rejectOwnAssignment = async (
       where: { id: context.driverProfileId, availabilityStatus: DriverAvailability.BUSY },
       data: { availabilityStatus: DriverAvailability.AVAILABLE },
     });
+
+    return toSafeDriverAssignment(
+      await tx.ambulanceAssignment.findUniqueOrThrow({
+        where: { id: assignmentId },
+        include: DRIVER_ASSIGNMENT_INCLUDE,
+      }),
+    );
+  });
+};
+
+/**
+ * One row of the driver-trip state machine (Task 1.22).
+ *
+ * Every field is a conditional claim, never a blind write: the assignment move, the emergency
+ * move and each resource move all name the exact state they expect to find, so a stale or
+ * repeated request matches zero rows and the whole transaction rolls back.
+ */
+interface TripTransition {
+  assignmentFrom: AmbulanceAssignmentStatus;
+  assignmentTo: AmbulanceAssignmentStatus;
+  emergencyFrom: EmergencyStatus;
+  emergencyTo: EmergencyStatus;
+  /** Vehicle move this step performs, when the step changes where the vehicle stands. */
+  ambulance?: { from: AmbulanceStatus; to: AmbulanceStatus };
+  /** Availability the driver returns to, when the step ends their involvement. */
+  driverTo?: DriverAvailability;
+  /** Timestamp column this step stamps. Each is stamped by exactly one action. */
+  stamp?: 'startedAt' | 'endedAt';
+}
+
+/**
+ * The driver's leg of the journey, from a committed offer to arrival at the hospital.
+ *
+ * ARRIVE_HOSPITAL completes the ASSIGNMENT, not the emergency: the dispatch is over, the
+ * vehicle and the driver go back to the pool, and the emergency rests at AT_HOSPITAL for
+ * admission and completion, which belong to a later task. Nothing here touches the bed
+ * reservation, and no retry, escalation or expiry is implied by any outcome.
+ */
+const TRIP_TRANSITIONS: Record<TripAction, TripTransition> = {
+  START: {
+    assignmentFrom: AmbulanceAssignmentStatus.ACCEPTED,
+    assignmentTo: AmbulanceAssignmentStatus.EN_ROUTE,
+    emergencyFrom: EmergencyStatus.PENDING_DRIVER_ACCEPTANCE,
+    emergencyTo: EmergencyStatus.DRIVER_EN_ROUTE,
+    ambulance: { from: AmbulanceStatus.ASSIGNED, to: AmbulanceStatus.EN_ROUTE },
+    stamp: 'startedAt',
+  },
+  ARRIVE_PICKUP: {
+    assignmentFrom: AmbulanceAssignmentStatus.EN_ROUTE,
+    assignmentTo: AmbulanceAssignmentStatus.AT_PICKUP,
+    emergencyFrom: EmergencyStatus.DRIVER_EN_ROUTE,
+    emergencyTo: EmergencyStatus.AT_PICKUP,
+  },
+  START_TRANSPORT: {
+    assignmentFrom: AmbulanceAssignmentStatus.AT_PICKUP,
+    assignmentTo: AmbulanceAssignmentStatus.TRANSPORTING,
+    emergencyFrom: EmergencyStatus.AT_PICKUP,
+    emergencyTo: EmergencyStatus.TRANSPORTING,
+  },
+  ARRIVE_HOSPITAL: {
+    assignmentFrom: AmbulanceAssignmentStatus.TRANSPORTING,
+    assignmentTo: AmbulanceAssignmentStatus.COMPLETED,
+    emergencyFrom: EmergencyStatus.TRANSPORTING,
+    emergencyTo: EmergencyStatus.AT_HOSPITAL,
+    ambulance: { from: AmbulanceStatus.EN_ROUTE, to: AmbulanceStatus.AVAILABLE },
+    driverTo: DriverAvailability.AVAILABLE,
+    stamp: 'endedAt',
+  },
+};
+
+/** A trip may only be abandoned once it is under way. */
+const FAILABLE_STATUSES: AmbulanceAssignmentStatus[] = [
+  AmbulanceAssignmentStatus.EN_ROUTE,
+  AmbulanceAssignmentStatus.AT_PICKUP,
+  AmbulanceAssignmentStatus.TRANSPORTING,
+];
+
+const tripStatusConflict = (): AppError =>
+  new AppError(
+    'ASSIGNMENT_STATUS_CONFLICT',
+    'This assignment is not in a state that allows this trip action.',
+    409,
+  );
+
+const stampFor = (transition: TripTransition): { startedAt?: Date } & { endedAt?: Date } => {
+  if (transition.stamp === 'startedAt') return { startedAt: new Date() };
+  if (transition.stamp === 'endedAt') return { endedAt: new Date() };
+  return {};
+};
+
+/**
+ * Advances the driver's own trip by one step (Task 1.22).
+ *
+ * Ownership is part of every write predicate, and each step is a single transaction containing
+ * the assignment claim, the vehicle and driver moves the step implies, and the emergency
+ * transition with its immutable history row. Every one of those is conditional on the exact
+ * state it expects, so a duplicate or out-of-order request mutates nothing and reports 409, and
+ * two concurrent actions on the same assignment serialize through the assignment row.
+ *
+ * Resource moves are fatal rather than best-effort: a trip step that could not move the vehicle
+ * it claims to be driving is not a trip step, and leaving the assignment advanced while the
+ * vehicle lags behind would be exactly the partial state this transaction exists to prevent.
+ *
+ * The emergency transition carries actorType DRIVER and the driver's authenticated User id —
+ * not their DriverProfile id, which is a resource identifier and not an actor.
+ */
+export const transitionOwnAssignment = async (
+  userId: string,
+  assignmentId: string,
+  action: TripAction,
+): Promise<SafeDriverAssignment> => {
+  const context = await resolveDriverContext(userId);
+  const transition = TRIP_TRANSITIONS[action];
+
+  return prisma.$transaction(async (tx) => {
+    const assignment = await tx.ambulanceAssignment.findFirst({
+      where: { id: assignmentId, driverId: context.driverProfileId },
+    });
+
+    if (!assignment) {
+      throw ASSIGNMENT_NOT_FOUND_ERROR;
+    }
+
+    const claimed = await tx.ambulanceAssignment.updateMany({
+      where: {
+        id: assignmentId,
+        driverId: context.driverProfileId,
+        status: transition.assignmentFrom,
+      },
+      data: { status: transition.assignmentTo, ...stampFor(transition) },
+    });
+
+    if (claimed.count === 0) {
+      throw tripStatusConflict();
+    }
+
+    if (transition.ambulance) {
+      const moved = await tx.ambulance.updateMany({
+        where: { id: assignment.ambulanceId, status: transition.ambulance.from },
+        data: { status: transition.ambulance.to },
+      });
+
+      if (moved.count === 0) {
+        throw new AppError(
+          'AMBULANCE_STATUS_CONFLICT',
+          'The ambulance for this assignment is not in the expected state for this trip action.',
+          409,
+        );
+      }
+    }
+
+    if (transition.driverTo) {
+      const released = await tx.driverProfile.updateMany({
+        where: { id: context.driverProfileId, availabilityStatus: DriverAvailability.BUSY },
+        data: { availabilityStatus: transition.driverTo },
+      });
+
+      if (released.count === 0) {
+        throw new AppError(
+          'DRIVER_STATUS_CONFLICT',
+          'Your availability is not in the expected state for this trip action.',
+          409,
+        );
+      }
+    }
+
+    const advanced = await transitionEmergency(tx, {
+      emergencyId: assignment.emergencyId,
+      from: transition.emergencyFrom,
+      to: transition.emergencyTo,
+      actorUserId: context.userId,
+      actorType: TransitionActorType.DRIVER,
+    });
+
+    if (!advanced) {
+      throw new AppError(
+        'EMERGENCY_STATUS_CONFLICT',
+        'This emergency is not in the expected state for this trip action.',
+        409,
+      );
+    }
+
+    return toSafeDriverAssignment(
+      await tx.ambulanceAssignment.findUniqueOrThrow({
+        where: { id: assignmentId },
+        include: DRIVER_ASSIGNMENT_INCLUDE,
+      }),
+    );
+  });
+};
+
+/**
+ * Abandons a trip that is already under way (Task 1.22).
+ *
+ * The row is kept as the historical attempt with its reason, stored in the existing
+ * rejectionReason column — the schema's single free-text field for a driver or operational
+ * explanation. The vehicle and the driver are released so they can be dispatched again.
+ *
+ * The emergency is deliberately NOT transitioned: no EmergencyStatus represents a failed
+ * transport, and whether to re-dispatch, escalate or expire after a failure is an
+ * emergency-level policy decision (DatabaseDesign.md section 8) that belongs to the
+ * orchestration layer, not to one driver's answer. The bed reservation is left untouched for
+ * the same reason; releasing it is the hospital's existing explicit action.
+ */
+export const failOwnAssignment = async (
+  userId: string,
+  assignmentId: string,
+  failureReason: string,
+): Promise<SafeDriverAssignment> => {
+  const context = await resolveDriverContext(userId);
+
+  return prisma.$transaction(async (tx) => {
+    const assignment = await tx.ambulanceAssignment.findFirst({
+      where: { id: assignmentId, driverId: context.driverProfileId },
+    });
+
+    if (!assignment) {
+      throw ASSIGNMENT_NOT_FOUND_ERROR;
+    }
+
+    if (!FAILABLE_STATUSES.includes(assignment.status)) {
+      throw tripStatusConflict();
+    }
+
+    // The claim names the exact status observed in this transaction, never the failable set.
+    // Under READ COMMITTED a waiting UPDATE re-evaluates its predicate against the new row
+    // version once the transaction holding the lock commits, so a set predicate would still
+    // match a concurrent move into another failable status (ARRIVE_PICKUP -> AT_PICKUP,
+    // START_TRANSPORT -> TRANSPORTING) and both callers would succeed. An exact predicate
+    // cannot re-match, so the loser sees zero rows and reports the conflict.
+    const failed = await tx.ambulanceAssignment.updateMany({
+      where: {
+        id: assignmentId,
+        driverId: context.driverProfileId,
+        status: assignment.status,
+      },
+      data: {
+        status: AmbulanceAssignmentStatus.FAILED,
+        endedAt: new Date(),
+        rejectionReason: failureReason,
+      },
+    });
+
+    if (failed.count === 0) {
+      throw tripStatusConflict();
+    }
+
+    // Every failable status is reached through START, which moved the vehicle to EN_ROUTE, so
+    // this is a required claim rather than a best-effort release.
+    const releasedAmbulance = await tx.ambulance.updateMany({
+      where: { id: assignment.ambulanceId, status: AmbulanceStatus.EN_ROUTE },
+      data: { status: AmbulanceStatus.AVAILABLE },
+    });
+
+    if (releasedAmbulance.count === 0) {
+      throw new AppError(
+        'AMBULANCE_STATUS_CONFLICT',
+        'The ambulance for this assignment is not in the expected state for this trip action.',
+        409,
+      );
+    }
+
+    const releasedDriver = await tx.driverProfile.updateMany({
+      where: { id: context.driverProfileId, availabilityStatus: DriverAvailability.BUSY },
+      data: { availabilityStatus: DriverAvailability.AVAILABLE },
+    });
+
+    if (releasedDriver.count === 0) {
+      throw new AppError(
+        'DRIVER_STATUS_CONFLICT',
+        'Your availability is not in the expected state for this trip action.',
+        409,
+      );
+    }
 
     return toSafeDriverAssignment(
       await tx.ambulanceAssignment.findUniqueOrThrow({

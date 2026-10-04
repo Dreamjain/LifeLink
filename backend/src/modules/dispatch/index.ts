@@ -5,6 +5,8 @@ export {
 } from './controllers/hospital-assignment.controller.js';
 export {
   acceptAssignment as acceptDriverAssignment,
+  changeAssignmentStatus as changeDriverAssignmentStatus,
+  failAssignment as failDriverAssignment,
   getAssignment as getDriverAssignment,
   listAssignments as listDriverAssignments,
   rejectAssignment as rejectDriverAssignment,

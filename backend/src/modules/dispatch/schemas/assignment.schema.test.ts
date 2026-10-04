@@ -2,11 +2,14 @@ import { randomUUID } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import { AppError } from '../../../common/errors/app-error.js';
 import {
+  TRIP_ACTIONS,
   parseAcceptAssignmentInput,
   parseAssignmentIdParam,
   parseCreateAssignmentInput,
   parseEmergencyIdParam,
+  parseFailAssignmentInput,
   parseRejectAssignmentInput,
+  parseTripActionInput,
 } from './assignment.schema.js';
 
 const expectValidationError = (act: () => unknown): void => {
@@ -114,5 +117,70 @@ describe('id params', () => {
     expectValidationError(() => parseAssignmentIdParam('not-a-uuid'));
     expectValidationError(() => parseEmergencyIdParam('not-a-uuid'));
     expectValidationError(() => parseAssignmentIdParam(undefined));
+  });
+});
+
+describe('parseTripActionInput', () => {
+  it('exposes exactly the four driver trip actions', () => {
+    expect([...TRIP_ACTIONS]).toEqual([
+      'START',
+      'ARRIVE_PICKUP',
+      'START_TRANSPORT',
+      'ARRIVE_HOSPITAL',
+    ]);
+  });
+
+  it.each(TRIP_ACTIONS)('accepts %s', (action) => {
+    expect(parseTripActionInput({ action })).toEqual({ action });
+  });
+
+  it('rejects an unknown action', () => {
+    expectValidationError(() => parseTripActionInput({ action: 'TELEPORT' }));
+  });
+
+  it('rejects a missing action', () => {
+    expectValidationError(() => parseTripActionInput({}));
+  });
+
+  it('rejects a raw status assignment instead of an action', () => {
+    expectValidationError(() => parseTripActionInput({ status: 'EN_ROUTE' }));
+  });
+
+  it('rejects an action smuggled alongside extra fields', () => {
+    expectValidationError(() =>
+      parseTripActionInput({ action: 'START', driverId: randomUUID(), startedAt: new Date() }),
+    );
+  });
+});
+
+describe('parseFailAssignmentInput', () => {
+  it('accepts a failure reason', () => {
+    expect(parseFailAssignmentInput({ failureReason: 'Vehicle broke down en route.' })).toEqual({
+      failureReason: 'Vehicle broke down en route.',
+    });
+  });
+
+  it('trims the failure reason', () => {
+    expect(parseFailAssignmentInput({ failureReason: '  Flat tyre.  ' })).toEqual({
+      failureReason: 'Flat tyre.',
+    });
+  });
+
+  it('requires a failure reason', () => {
+    expectValidationError(() => parseFailAssignmentInput({}));
+    expectValidationError(() => parseFailAssignmentInput({ failureReason: '   ' }));
+  });
+
+  it('rejects an over-long failure reason', () => {
+    expectValidationError(() => parseFailAssignmentInput({ failureReason: 'x'.repeat(501) }));
+  });
+
+  it('rejects a client-supplied status or timestamp', () => {
+    expectValidationError(() =>
+      parseFailAssignmentInput({ failureReason: 'Flat tyre.', status: 'FAILED' }),
+    );
+    expectValidationError(() =>
+      parseFailAssignmentInput({ failureReason: 'Flat tyre.', endedAt: new Date() }),
+    );
   });
 });

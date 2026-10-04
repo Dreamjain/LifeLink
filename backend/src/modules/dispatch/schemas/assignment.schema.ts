@@ -31,6 +31,36 @@ export const rejectAssignmentSchema = z
 
 export type RejectAssignmentInput = z.infer<typeof rejectAssignmentSchema>;
 
+/**
+ * Explicit operational actions, never a raw status assignment (DatabaseDesign.md section 9).
+ * Mirrors the BED_STATUS_ACTIONS / AMBULANCE_STATUS_ACTIONS precedent in resource.schema.ts:
+ * a driver names what happened on the road, and the service owns which statuses that implies.
+ */
+export const TRIP_ACTIONS = [
+  'START',
+  'ARRIVE_PICKUP',
+  'START_TRANSPORT',
+  'ARRIVE_HOSPITAL',
+] as const;
+
+export const tripActionSchema = z
+  .object({
+    action: z.enum(TRIP_ACTIONS),
+  })
+  .strict();
+
+export type TripAction = (typeof TRIP_ACTIONS)[number];
+export type TripActionInput = z.infer<typeof tripActionSchema>;
+
+/** A failed trip must say why, exactly as a rejected offer must. */
+export const failAssignmentSchema = z
+  .object({
+    failureReason: reasonSchema,
+  })
+  .strict();
+
+export type FailAssignmentInput = z.infer<typeof failAssignmentSchema>;
+
 const assignmentIdParamSchema = z.string().uuid('A valid assignment id is required.');
 const emergencyIdParamSchema = z.string().uuid('A valid emergency id is required.');
 
@@ -55,6 +85,10 @@ export const parseAcceptAssignmentInput = (payload: unknown): AcceptAssignmentIn
   parse(acceptAssignmentSchema, payload);
 export const parseRejectAssignmentInput = (payload: unknown): RejectAssignmentInput =>
   parse(rejectAssignmentSchema, payload);
+export const parseTripActionInput = (payload: unknown): TripActionInput =>
+  parse(tripActionSchema, payload);
+export const parseFailAssignmentInput = (payload: unknown): FailAssignmentInput =>
+  parse(failAssignmentSchema, payload);
 export const parseAssignmentIdParam = (payload: unknown): string =>
   parse(assignmentIdParamSchema, payload);
 export const parseEmergencyIdParam = (payload: unknown): string =>

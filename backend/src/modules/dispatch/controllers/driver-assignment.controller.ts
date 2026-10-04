@@ -5,13 +5,17 @@ import type { AuthenticatedPrincipal } from '../../auth/index.js';
 import {
   parseAcceptAssignmentInput,
   parseAssignmentIdParam,
+  parseFailAssignmentInput,
   parseRejectAssignmentInput,
+  parseTripActionInput,
 } from '../schemas/assignment.schema.js';
 import {
   acceptOwnAssignment,
+  failOwnAssignment,
   getOwnAssignment,
   listOwnAssignments,
   rejectOwnAssignment,
+  transitionOwnAssignment,
 } from '../services/driver-assignment.service.js';
 
 const requirePrincipal = (req: Request): AuthenticatedPrincipal => {
@@ -112,6 +116,71 @@ export const rejectAssignment = async (
         hasReason: true,
       },
       'dispatch.assignment.reject.success',
+    );
+    res.status(200).json({ assignment });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const changeAssignmentStatus = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const principal = requirePrincipal(req);
+    const assignmentId = parseAssignmentIdParam(req.params.assignmentId);
+    const input = parseTripActionInput(req.body);
+
+    const assignment = await transitionOwnAssignment(principal.userId, assignmentId, input.action);
+
+    logger.info(
+      {
+        correlationId: req.correlationId,
+        actorUserId: principal.userId,
+        assignmentId,
+        emergencyId: assignment.emergencyId,
+        ambulanceId: assignment.ambulanceId,
+        driverId: assignment.driverId,
+        tripAction: input.action,
+        status: assignment.status,
+        emergencyStatus: assignment.emergency.currentStatus,
+        action: 'transition-assignment',
+      },
+      'dispatch.assignment.trip.success',
+    );
+    res.status(200).json({ assignment });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const failAssignment = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    const principal = requirePrincipal(req);
+    const assignmentId = parseAssignmentIdParam(req.params.assignmentId);
+    const input = parseFailAssignmentInput(req.body);
+
+    const assignment = await failOwnAssignment(principal.userId, assignmentId, input.failureReason);
+
+    logger.info(
+      {
+        correlationId: req.correlationId,
+        actorUserId: principal.userId,
+        assignmentId,
+        emergencyId: assignment.emergencyId,
+        ambulanceId: assignment.ambulanceId,
+        driverId: assignment.driverId,
+        action: 'fail-assignment',
+        // The reason itself is never logged: it is free text from an operational actor.
+        hasReason: true,
+      },
+      'dispatch.assignment.fail.success',
     );
     res.status(200).json({ assignment });
   } catch (error) {
