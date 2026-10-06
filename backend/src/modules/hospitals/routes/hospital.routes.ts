@@ -27,6 +27,8 @@ import {
   rejectResponse,
 } from '../controllers/hospital-response.controller.js';
 import {
+  admitEmergency,
+  completeEmergency,
   createReservation,
   getReservation,
   listReservations,
@@ -98,3 +100,9 @@ hospitalRouter.post(
   requireResponder,
   createHospitalAssignment,
 );
+
+// Admission and completion (Task 1.23): any active staff may read the emergency through the
+// surfaces above; RECEPTIONIST may not admit or complete. Both are scoped through this
+// hospital's own accepted response, so no hospital id is accepted from the client.
+hospitalRouter.post('/me/emergencies/:emergencyId/admit', requireResponder, admitEmergency);
+hospitalRouter.post('/me/emergencies/:emergencyId/complete', requireResponder, completeEmergency);

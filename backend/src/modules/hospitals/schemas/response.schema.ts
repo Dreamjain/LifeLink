@@ -32,8 +32,19 @@ export const releaseReservationSchema = z
 
 export type ReleaseReservationInput = z.infer<typeof releaseReservationSchema>;
 
+/** Admission carries no payload: every field of the action is server-controlled. */
+export const admitEmergencySchema = z.object({}).strict();
+
+export type AdmitEmergencyInput = z.infer<typeof admitEmergencySchema>;
+
+/** Completion carries no payload: every field of the action is server-controlled. */
+export const completeEmergencySchema = z.object({}).strict();
+
+export type CompleteEmergencyInput = z.infer<typeof completeEmergencySchema>;
+
 const responseIdParamSchema = z.string().uuid('A valid hospital response id is required.');
 const reservationIdParamSchema = z.string().uuid('A valid reservation id is required.');
+const emergencyIdParamSchema = z.string().uuid('A valid emergency id is required.');
 
 const parse = <T>(schema: z.ZodType<T>, payload: unknown): T => {
   const result = schema.safeParse(payload);
@@ -62,3 +73,9 @@ export const parseResponseIdParam = (payload: unknown): string =>
   parse(responseIdParamSchema, payload);
 export const parseReservationIdParam = (payload: unknown): string =>
   parse(reservationIdParamSchema, payload);
+export const parseAdmitEmergencyInput = (payload: unknown): AdmitEmergencyInput =>
+  parse(admitEmergencySchema, payload);
+export const parseCompleteEmergencyInput = (payload: unknown): CompleteEmergencyInput =>
+  parse(completeEmergencySchema, payload);
+export const parseEmergencyIdParam = (payload: unknown): string =>
+  parse(emergencyIdParamSchema, payload);

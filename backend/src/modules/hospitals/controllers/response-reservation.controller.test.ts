@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Request, Response } from 'express';
 import {
+  BedReservationStatus,
   BedStatus,
   EmergencyStatus,
   HospitalResponseStatus,
@@ -22,6 +23,8 @@ import {
   rejectResponse,
 } from './hospital-response.controller.js';
 import {
+  admitEmergency,
+  completeEmergency,
   createReservation,
   getReservation,
   listReservations,
@@ -560,6 +563,269 @@ describe('bed reservation controller', () => {
 
     expect((await prisma.bed.findUniqueOrThrow({ where: { id: bedB.id } })).status).toBe(
       BedStatus.RESERVED,
+    );
+  });
+});
+
+describe('admission and completion controllers', () => {
+  /** An arrived emergency holding a RESERVED bed, seeded directly. */
+  const seedArrivedEmergency = async (scope: HospitalStaffContext, actorUserId: string) => {
+    const seed = await seedEmergency({
+      hospitalId: scope.hospitalId,
+      emergencyStatus: EmergencyStatus.AT_HOSPITAL,
+      responseStatus: HospitalResponseStatus.ACCEPTED,
+    });
+    const bed = await createBed(scope.hospitalId);
+    await prisma.bed.update({ where: { id: bed.id }, data: { status: BedStatus.RESERVED } });
+    const reservation = await prisma.bedReservation.create({
+      data: {
+        emergencyId: seed.emergency.id,
+        hospitalResponseId: seed.response.id,
+        bedId: bed.id,
+        status: BedReservationStatus.RESERVED,
+        reservedByUserId: actorUserId,
+      },
+    });
+
+    return { seed, bed, reservation };
+  };
+
+  it('admits an arrived emergency and returns the emergency and the reservation', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const arrived = await seedArrivedEmergency(scope, actorUserId);
+    const res = buildRes();
+
+    await admitEmergency(
+      buildReq({ params: { emergencyId: arrived.seed.emergency.id }, scope, actorUserId }),
+      res,
+      vi.fn(),
+    );
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    const payload = jsonPayload(res) as {
+      emergency: { id: string; currentStatus: string };
+      reservation: { id: string; status: string };
+    };
+    expect(payload.emergency.id).toBe(arrived.seed.emergency.id);
+    expect(payload.emergency.currentStatus).toBe(EmergencyStatus.ADMITTED);
+    expect(payload.reservation.id).toBe(arrived.reservation.id);
+    expect(payload.reservation.status).toBe(BedReservationStatus.CONSUMED);
+    // No PatientProfile field is reachable through either projection.
+    const serialized = JSON.stringify(payload);
+    expect(serialized).not.toContain('allergies');
+    expect(serialized).not.toContain('medicalSummary');
+    expect(serialized).not.toContain('passwordHash');
+  });
+
+  it('completes an admitted emergency and returns the emergency', async () => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const arrived = await seedArrivedEmergency(scope, actorUserId);
+    await admitEmergency(
+      buildReq({ params: { emergencyId: arrived.seed.emergency.id }, scope, actorUserId }),
+      buildRes(),
+      vi.fn(),
+    );
+    const res = buildRes();
+
+    await completeEmergency(
+      buildReq({ params: { emergencyId: arrived.seed.emergency.id }, scope, actorUserId }),
+      res,
+      vi.fn(),
+    );
+
+    expect(res.status).toHaveBeenCalledWith(200);
+    const payload = jsonPayload(res) as { emergency: { currentStatus: string } };
+    expect(payload.emergency.currentStatus).toBe(EmergencyStatus.COMPLETED);
+    expect(
+      (
+        await prisma.emergencyRequest.findUniqueOrThrow({
+          where: { id: arrived.seed.emergency.id },
+        })
+      ).completedAt,
+    ).toBeInstanceOf(Date);
+  });
+
+  it.each([
+    ['status', { status: 'ADMITTED' }],
+    ['completedAt', { completedAt: new Date() }],
+    ['actorUserId', { actorUserId: randomUUID() }],
+    ['hospitalId', { hospitalId: randomUUID() }],
+    ['reservationId', { reservationId: randomUUID() }],
+    ['bedId', { bedId: randomUUID() }],
+  ])('rejects an injected %s on admit and changes nothing', async (_label, injected) => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const arrived = await seedArrivedEmergency(scope, actorUserId);
+    const next = vi.fn();
+
+    await admitEmergency(
+      buildReq({
+        params: { emergencyId: arrived.seed.emergency.id },
+        body: injected,
+        scope,
+        actorUserId,
+      }),
+      buildRes(),
+      next,
+    );
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'VALIDATION_ERROR' }));
+    expect(
+      (await prisma.bedReservation.findUniqueOrThrow({ where: { id: arrived.reservation.id } }))
+        .status,
+    ).toBe(BedReservationStatus.RESERVED);
+    expect((await prisma.bed.findUniqueOrThrow({ where: { id: arrived.bed.id } })).status).toBe(
+      BedStatus.RESERVED,
+    );
+  });
+
+  it.each([
+    ['status', { status: 'COMPLETED' }],
+    ['completedAt', { completedAt: new Date() }],
+  ])('rejects an injected %s on complete and changes nothing', async (_label, injected) => {
+    const scope = await createScope();
+    const actorUserId = await createActor();
+    const arrived = await seedArrivedEmergency(scope, actorUserId);
+    await admitEmergency(
+      buildReq({ params: { emergencyId: arrived.seed.emergency.id }, scope, actorUserId }),
+      buildRes(),
+      vi.fn(),
+    );
+    const next = vi.fn();
+
+    await completeEmergency(
+      buildReq({
+        params: { emergencyId: arrived.seed.emergency.id },
+        body: injected,
+        scope,
+        actorUserId,
+      }),
+      buildRes(),
+      next,
+    );
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'VALIDATION_ERROR' }));
+    const stored = await prisma.emergencyRequest.findUniqueOrThrow({
+      where: { id: arrived.seed.emergency.id },
+    });
+    expect(stored.currentStatus).toBe(EmergencyStatus.ADMITTED);
+    expect(stored.completedAt).toBeNull();
+  });
+
+  it.each([admitEmergency, completeEmergency])(
+    'rejects a non-uuid emergency id',
+    async (handler) => {
+      const scope = await createScope();
+      const actorUserId = await createActor();
+      const next = vi.fn();
+
+      await handler(
+        buildReq({ params: { emergencyId: 'not-a-uuid' }, scope, actorUserId }),
+        buildRes(),
+        next,
+      );
+
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'VALIDATION_ERROR' }));
+    },
+  );
+
+  it.each([admitEmergency, completeEmergency])(
+    'requires an active hospital membership',
+    async (handler) => {
+      const actorUserId = await createActor();
+      const next = vi.fn();
+
+      await handler(
+        buildReq({ params: { emergencyId: randomUUID() }, actorUserId }),
+        buildRes(),
+        next,
+      );
+
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'HOSPITAL_SCOPE_DENIED' }));
+    },
+  );
+
+  it.each([admitEmergency, completeEmergency])(
+    'requires an authenticated actor',
+    async (handler) => {
+      const scope = await createScope();
+      const next = vi.fn();
+
+      await handler(buildReq({ params: { emergencyId: randomUUID() }, scope }), buildRes(), next);
+
+      expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'MISSING_TOKEN' }));
+    },
+  );
+
+  it.each([admitEmergency, completeEmergency])(
+    'does not disclose another hospital emergency',
+    async (handler) => {
+      const scopeA = await createScope();
+      const scopeB = await createScope();
+      const actorUserId = await createActor();
+      const arrived = await seedArrivedEmergency(scopeB, actorUserId);
+      const next = vi.fn();
+
+      await handler(
+        buildReq({
+          params: { emergencyId: arrived.seed.emergency.id },
+          scope: scopeA,
+          actorUserId,
+        }),
+        buildRes(),
+        next,
+      );
+
+      expect(next).toHaveBeenCalledWith(
+        expect.objectContaining({ code: 'EMERGENCY_NOT_FOUND', statusCode: 404 }),
+      );
+      expect(
+        (
+          await prisma.emergencyRequest.findUniqueOrThrow({
+            where: { id: arrived.seed.emergency.id },
+          })
+        ).currentStatus,
+      ).toBe(EmergencyStatus.AT_HOSPITAL);
+    },
+  );
+
+  it.each(RESPONDER_ROLES)('%s passes the admission/completion role gate', (staffRole) => {
+    const next = vi.fn();
+    requireHospitalStaffRole(...RESPONDER_ROLES)(
+      buildReq({
+        scope: {
+          membershipId: randomUUID(),
+          hospitalId: randomUUID(),
+          staffRole,
+          membershipStatus: MembershipStatus.ACTIVE,
+        },
+      }),
+      buildRes(),
+      next,
+    );
+
+    expect(next).toHaveBeenCalledWith();
+  });
+
+  it('RECEPTIONIST is blocked from the admission/completion gate', () => {
+    const next = vi.fn();
+    requireHospitalStaffRole(...RESPONDER_ROLES)(
+      buildReq({
+        scope: {
+          membershipId: randomUUID(),
+          hospitalId: randomUUID(),
+          staffRole: HospitalStaffRole.RECEPTIONIST,
+          membershipStatus: MembershipStatus.ACTIVE,
+        },
+      }),
+      buildRes(),
+      next,
+    );
+
+    expect(next).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'INSUFFICIENT_HOSPITAL_ROLE' }),
     );
   });
 });

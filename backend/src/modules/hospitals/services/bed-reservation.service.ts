@@ -7,6 +7,10 @@ import {
 import type { BedReservation } from '@prisma/client';
 import { prisma } from '../../../database/prisma.js';
 import { AppError } from '../../../common/errors/app-error.js';
+import {
+  toSafeEmergency,
+  type SafeEmergencySummary,
+} from '../../../common/projections/emergency.projection.js';
 import type { HospitalStaffContext } from '../types/hospital.types.js';
 import { transitionEmergency } from './emergency-status.service.js';
 
@@ -49,6 +53,17 @@ const RESPONSE_NOT_FOUND_ERROR = new AppError(
 );
 
 const BED_NOT_FOUND_ERROR = new AppError('BED_NOT_FOUND', 'No bed was found for this id.', 404);
+
+/**
+ * An emergency reaches a hospital only through an accepted HospitalResponse, so an emergency
+ * this hospital never accepted is reported as not found rather than forbidden: existence is
+ * never disclosed across hospitals (the Task 1.16 dispatch precedent).
+ */
+const EMERGENCY_NOT_FOUND_ERROR = new AppError(
+  'EMERGENCY_NOT_FOUND',
+  'No accepted emergency was found for this id.',
+  404,
+);
 
 /** Reservations are scoped through their hospital response, which carries the hospitalId. */
 const hospitalScoped = (context: HospitalStaffContext, reservationId: string) => ({
@@ -304,6 +319,198 @@ export const releaseReservation = async (
 
     return toSafeReservation(
       await tx.bedReservation.findUniqueOrThrow({ where: { id: reservationId } }),
+    );
+  });
+};
+
+export interface AdmissionResult {
+  emergency: SafeEmergencySummary;
+  reservation: SafeBedReservation;
+}
+
+/**
+ * Resolves the accepting hospital response for an emergency, which is this hospital's proof of
+ * scope. A client-supplied hospital id is never accepted; the id comes from the caller's
+ * membership (AuthenticationDesign.md section 11).
+ */
+const requireAcceptedResponse = async (
+  tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  context: HospitalStaffContext,
+  emergencyId: string,
+): Promise<{ id: string }> => {
+  const response = await tx.hospitalResponse.findFirst({
+    where: {
+      emergencyId,
+      hospitalId: context.hospitalId,
+      status: HospitalResponseStatus.ACCEPTED,
+    },
+    select: { id: true },
+  });
+
+  if (!response) {
+    throw EMERGENCY_NOT_FOUND_ERROR;
+  }
+
+  return response;
+};
+
+/**
+ * Admits a patient who has arrived at the accepting hospital (Task 1.23).
+ *
+ * One transaction, three conditional claims, all of which must succeed: the reservation is
+ * consumed, the bed it was holding becomes occupied, and the emergency moves
+ * AT_HOSPITAL -> ADMITTED with its immutable history row. A failure anywhere rolls the whole
+ * thing back, so a consumed reservation can never coexist with an unoccupied bed, and an
+ * ADMITTED emergency can never coexist with a bed that is still merely reserved.
+ *
+ * Every claim names one EXACT expected status. A set predicate would be unsafe here: under
+ * READ COMMITTED a blocked UPDATE re-evaluates its predicate against the row version the
+ * winning transaction committed, so a range of acceptable states can re-match and let a second
+ * caller succeed on top of the first (the defect Task 1.22 exposed). With exact predicates the
+ * loser matches zero rows and reports the conflict.
+ *
+ * Bed occupation lives here rather than in the maintenance-only bed service, which states that
+ * RESERVED/OCCUPIED belong to the reservation workflow.
+ */
+export const admitEmergency = async (
+  context: HospitalStaffContext,
+  emergencyId: string,
+  actorUserId: string,
+): Promise<AdmissionResult> => {
+  return prisma.$transaction(async (tx) => {
+    await requireAcceptedResponse(tx, context, emergencyId);
+
+    // 1. The active reservation for this emergency, scoped through its hospital response.
+    const reservation = await tx.bedReservation.findFirst({
+      where: {
+        emergencyId,
+        hospitalResponse: { hospitalId: context.hospitalId },
+        status: BedReservationStatus.RESERVED,
+      },
+    });
+
+    if (!reservation) {
+      // Distinguish "this emergency never held a reservation here" from "its reservation is no
+      // longer active". Both probes are hospital-scoped, so neither discloses another hospital.
+      const historic = await tx.bedReservation.findFirst({
+        where: { emergencyId, hospitalResponse: { hospitalId: context.hospitalId } },
+        select: { id: true },
+      });
+
+      if (!historic) {
+        throw RESERVATION_NOT_FOUND_ERROR;
+      }
+
+      throw new AppError(
+        'RESERVATION_STATUS_CONFLICT',
+        'Only an active reservation can be consumed on admission.',
+        409,
+      );
+    }
+
+    // 2. Consume the reservation. This is the race guard for admission: only one transaction
+    //    can move it RESERVED -> CONSUMED.
+    const consumed = await tx.bedReservation.updateMany({
+      where: { id: reservation.id, status: BedReservationStatus.RESERVED },
+      data: { status: BedReservationStatus.CONSUMED },
+    });
+
+    if (consumed.count === 0) {
+      throw new AppError(
+        'RESERVATION_STATUS_CONFLICT',
+        'Only an active reservation can be consumed on admission.',
+        409,
+      );
+    }
+
+    // 3. Occupy the bed it was holding. Ownership is part of the same conditional update, so
+    //    another hospital's bed can never be occupied.
+    const occupied = await tx.bed.updateMany({
+      where: {
+        id: reservation.bedId,
+        hospitalId: context.hospitalId,
+        status: BedStatus.RESERVED,
+      },
+      data: { status: BedStatus.OCCUPIED },
+    });
+
+    if (occupied.count === 0) {
+      throw new AppError(
+        'BED_STATUS_CONFLICT',
+        'The reserved bed for this emergency is no longer held for it.',
+        409,
+      );
+    }
+
+    // 4. The emergency row is the single point of serialization for this emergency: two
+    //    admissions cannot both move it out of AT_HOSPITAL.
+    const admitted = await transitionEmergency(tx, {
+      emergencyId,
+      from: EmergencyStatus.AT_HOSPITAL,
+      to: EmergencyStatus.ADMITTED,
+      actorUserId,
+    });
+
+    if (!admitted) {
+      throw new AppError(
+        'EMERGENCY_STATUS_CONFLICT',
+        'This emergency is not awaiting admission.',
+        409,
+      );
+    }
+
+    return {
+      emergency: toSafeEmergency(
+        await tx.emergencyRequest.findUniqueOrThrow({ where: { id: emergencyId } }),
+      ),
+      reservation: toSafeReservation(
+        await tx.bedReservation.findUniqueOrThrow({ where: { id: reservation.id } }),
+      ),
+    };
+  });
+};
+
+/**
+ * Completes an admitted emergency (Task 1.23).
+ *
+ * A separate transaction from admission, and a separate decision: a hospital admits on arrival
+ * and completes when care for this emergency is finished. ADMITTED is the only accepted source
+ * state, so AT_HOSPITAL can never skip straight to COMPLETED.
+ *
+ * completedAt is written by the same conditional update that moves the status, through
+ * transitionEmergency's `fields` (the Task 1.17 cancelledAt precedent). A second write would
+ * allow the timestamp to be stamped without the status moving, or stamped twice by a losing
+ * concurrent caller. cancelledAt and expiresAt are untouched.
+ *
+ * No resource is released here: the bed stays OCCUPIED and the reservation stays CONSUMED.
+ * Discharge is not part of this task.
+ */
+export const completeEmergency = async (
+  context: HospitalStaffContext,
+  emergencyId: string,
+  actorUserId: string,
+): Promise<SafeEmergencySummary> => {
+  return prisma.$transaction(async (tx) => {
+    await requireAcceptedResponse(tx, context, emergencyId);
+
+    const completed = await transitionEmergency(tx, {
+      emergencyId,
+      from: EmergencyStatus.ADMITTED,
+      to: EmergencyStatus.COMPLETED,
+      actorUserId,
+      fields: { completedAt: new Date() },
+    });
+
+    if (!completed) {
+      throw new AppError(
+        'EMERGENCY_STATUS_CONFLICT',
+        'Only an admitted emergency can be completed.',
+        409,
+      );
+    }
+
+    return toSafeEmergency(
+      await tx.emergencyRequest.findUniqueOrThrow({ where: { id: emergencyId } }),
     );
   });
 };
