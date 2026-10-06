@@ -5,6 +5,7 @@ import {
   EmergencyStatus,
   HospitalResponseStatus,
   Prisma,
+  TransitionActorType,
   UserStatus,
   VerificationStatus,
 } from '@prisma/client';
@@ -111,6 +112,20 @@ const DRIVER_NOT_FOUND_ERROR = new AppError(
   404,
 );
 
+/**
+ * The only part of the caller's hospital scope that dispatch reads. A staff request passes its
+ * full HospitalStaffContext; Task 1.24 recovery, which has no staff caller, passes the accepting
+ * hospital resolved from the emergency's own ACCEPTED response.
+ */
+export type DispatchScope = Pick<HospitalStaffContext, 'hospitalId'>;
+
+/**
+ * Task 1.24: at most this many AmbulanceAssignment rows may exist for one emergency. Every row is
+ * one dispatch attempt (attemptNumber); this is unrelated to AUTO_ASSIGNMENT_MAX_ATTEMPTS below,
+ * which bounds contention retries inside a single automatic dispatch.
+ */
+export const MAX_DISPATCH_ATTEMPTS = 3;
+
 /** Assignments are scoped through their hospital response, which carries the hospitalId. */
 const hospitalScope = (context: HospitalStaffContext) => ({
   hospitalResponse: { hospitalId: context.hospitalId },
@@ -157,13 +172,22 @@ export const getAssignment = async (
  * Operational claim states (OFFERED/ASSIGNED/BUSY) are deliberately distinct from the
  * Task 1.14 maintenance workflow (AVAILABLE <-> OUT_OF_SERVICE / INACTIVE), which only
  * ever transitions from AVAILABLE and therefore cannot touch a committed vehicle.
+ *
+ * `actorUserId` is the staff member who dispatched, or null when the system dispatched on its
+ * own (Task 1.24 recovery): the emergency transitions are then recorded with actorType SYSTEM
+ * and no actor user, never attributed to a person who did not act.
  */
 export const createAssignment = async (
-  context: HospitalStaffContext,
+  context: DispatchScope,
   emergencyId: string,
   input: CreateAssignmentInput,
-  actorUserId: string,
+  actorUserId: string | null,
 ): Promise<SafeHospitalAssignment> => {
+  const actor =
+    actorUserId === null
+      ? { actorType: TransitionActorType.SYSTEM }
+      : { actorUserId, actorType: TransitionActorType.HOSPITAL_STAFF };
+
   try {
     return await prisma.$transaction(async (tx) => {
       // 1. The accepted response is both the hospital-scope proof and the assignment's parent.
@@ -236,8 +260,20 @@ export const createAssignment = async (
         );
       }
 
-      // 4. Attempts are never overwritten; each dispatch is a new numbered attempt.
-      const attemptNumber = (await tx.ambulanceAssignment.count({ where: { emergencyId } })) + 1;
+      // 4. Attempts are never overwritten; each dispatch is a new numbered attempt. Task 1.24
+      //    caps the rows per emergency; the (emergencyId, attemptNumber) unique constraint keeps
+      //    two concurrent dispatches from both taking the last slot.
+      const previousAttempts = await tx.ambulanceAssignment.count({ where: { emergencyId } });
+
+      if (previousAttempts >= MAX_DISPATCH_ATTEMPTS) {
+        throw new AppError(
+          'DISPATCH_ATTEMPTS_EXHAUSTED',
+          'This emergency has used all of its ambulance dispatch attempts.',
+          409,
+        );
+      }
+
+      const attemptNumber = previousAttempts + 1;
 
       const assignment = await tx.ambulanceAssignment.create({
         data: {
@@ -256,7 +292,7 @@ export const createAssignment = async (
         emergencyId,
         from: EmergencyStatus.BED_RESERVED,
         to: EmergencyStatus.AMBULANCE_ASSIGNED,
-        actorUserId,
+        ...actor,
       });
 
       if (!assigned) {
@@ -273,7 +309,7 @@ export const createAssignment = async (
         emergencyId,
         from: EmergencyStatus.AMBULANCE_ASSIGNED,
         to: EmergencyStatus.PENDING_DRIVER_ACCEPTANCE,
-        actorUserId,
+        ...actor,
       });
 
       if (!pending) {
@@ -314,6 +350,15 @@ export const createAssignment = async (
  */
 const AUTO_ASSIGNMENT_MAX_ATTEMPTS = 3;
 
+/**
+ * Resources an automatic dispatch must never select, in addition to those it loses to contention.
+ * Task 1.24 recovery passes every ambulance and driver already used by the emergency.
+ */
+export interface AutoAssignmentOptions {
+  excludeAmbulanceIds?: readonly string[];
+  excludeDriverIds?: readonly string[];
+}
+
 export interface AutoAssignmentResult {
   assigned: boolean;
   assignment: SafeHospitalAssignment | null;
@@ -348,16 +393,21 @@ export interface AutoAssignmentResult {
  *
  * Finding no vehicle or no driver is a normal outcome, not an error: the caller keeps its
  * acceptance and its bed, and the emergency stays BED_RESERVED. No FAILED assignment row is
- * invented, no ESCALATED history is appended, and retry or escalation belongs to Task 1.24.
- * The manual dispatch endpoint remains the recovery path.
+ * invented and no ESCALATED history is appended here; Task 1.24 recovery owns re-dispatch and
+ * escalation after an attempt ends. The manual dispatch endpoint remains the recovery path.
+ *
+ * `options` lets Task 1.24 recovery exclude resources the emergency already used. Exclusions are
+ * applied to candidate selection only; they never count towards AUTO_ASSIGNMENT_MAX_ATTEMPTS,
+ * which still bounds contention retries alone.
  */
 export const autoAssignAmbulanceForReservedEmergency = async (
-  context: HospitalStaffContext,
+  context: DispatchScope,
   emergencyId: string,
-  actorUserId: string,
+  actorUserId: string | null,
+  options: AutoAssignmentOptions = {},
 ): Promise<AutoAssignmentResult> => {
-  const lostAmbulanceIds: string[] = [];
-  const lostDriverIds: string[] = [];
+  const lostAmbulanceIds: string[] = [...(options.excludeAmbulanceIds ?? [])];
+  const lostDriverIds: string[] = [...(options.excludeDriverIds ?? [])];
 
   for (let attempt = 1; attempt <= AUTO_ASSIGNMENT_MAX_ATTEMPTS; attempt += 1) {
     const ambulance = await prisma.ambulance.findFirst({

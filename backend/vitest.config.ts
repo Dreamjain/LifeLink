@@ -7,5 +7,9 @@ export default defineConfig({
   test: {
     testTimeout: 30_000,
     hookTimeout: 30_000,
+    // Every DB-backed test file shares one database, and dispatch selects the oldest eligible
+    // driver from the global pool, so files must not run concurrently or one file's fixture
+    // drivers can be dispatched by another file. Tests inside a file were already sequential.
+    fileParallelism: false,
   },
 });

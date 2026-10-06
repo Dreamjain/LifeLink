@@ -16,6 +16,7 @@ import { transitionEmergency } from '../../hospitals/services/emergency-status.s
 import type { TripAction } from '../schemas/assignment.schema.js';
 import type { DriverContext } from '../types/dispatch.types.js';
 import { toSafeAssignmentAmbulance, type SafeAssignmentAmbulance } from './assignment.service.js';
+import { runDispatchRecoverySafely } from './dispatch-recovery.service.js';
 
 /** Destination context a driver needs to complete the run. An organisation, not a person. */
 export interface SafeAssignmentHospital {
@@ -230,9 +231,11 @@ export const acceptOwnAssignment = async (
  * reason; the vehicle and the driver are released back to AVAILABLE so they can be
  * offered again.
  *
- * No replacement assignment is created and no emergency-level transition is invented:
- * whether to retry, rematch, escalate or expire belongs to the orchestration layer
- * (DatabaseDesign.md section 8), not to a single driver's answer.
+ * The rejection transaction itself creates no replacement assignment and no emergency-level
+ * transition. Once it has committed, Task 1.24 dispatch recovery runs as a separate follow-up
+ * (decision D7): it may return the emergency to BED_RESERVED and re-dispatch, or escalate. A
+ * recovery failure is logged and never undoes the rejection. The response is the committed
+ * rejection; the driver is not shown how the emergency was re-dispatched.
  */
 export const rejectOwnAssignment = async (
   userId: string,
@@ -241,7 +244,7 @@ export const rejectOwnAssignment = async (
 ): Promise<SafeDriverAssignment> => {
   const context = await resolveDriverContext(userId);
 
-  return prisma.$transaction(async (tx) => {
+  const rejectedAssignment = await prisma.$transaction(async (tx) => {
     const assignment = await tx.ambulanceAssignment.findFirst({
       where: { id: assignmentId, driverId: context.driverProfileId },
     });
@@ -286,6 +289,10 @@ export const rejectOwnAssignment = async (
       }),
     );
   });
+
+  await runDispatchRecoverySafely(rejectedAssignment.emergencyId, 'DRIVER_REJECTED');
+
+  return rejectedAssignment;
 };
 
 /**
@@ -476,11 +483,11 @@ export const transitionOwnAssignment = async (
  * rejectionReason column — the schema's single free-text field for a driver or operational
  * explanation. The vehicle and the driver are released so they can be dispatched again.
  *
- * The emergency is deliberately NOT transitioned: no EmergencyStatus represents a failed
- * transport, and whether to re-dispatch, escalate or expire after a failure is an
- * emergency-level policy decision (DatabaseDesign.md section 8) that belongs to the
- * orchestration layer, not to one driver's answer. The bed reservation is left untouched for
- * the same reason; releasing it is the hospital's existing explicit action.
+ * The failure transaction itself does NOT transition the emergency: no EmergencyStatus represents
+ * a failed transport, and the bed reservation is left untouched. Once it has committed, Task 1.24
+ * dispatch recovery runs as a separate follow-up (decisions D1, D7): it returns the emergency to
+ * BED_RESERVED as SYSTEM and re-dispatches, or escalates, and still never touches the bed. A
+ * recovery failure is logged and never undoes the failure itself.
  */
 export const failOwnAssignment = async (
   userId: string,
@@ -489,7 +496,7 @@ export const failOwnAssignment = async (
 ): Promise<SafeDriverAssignment> => {
   const context = await resolveDriverContext(userId);
 
-  return prisma.$transaction(async (tx) => {
+  const failedAssignment = await prisma.$transaction(async (tx) => {
     const assignment = await tx.ambulanceAssignment.findFirst({
       where: { id: assignmentId, driverId: context.driverProfileId },
     });
@@ -560,4 +567,8 @@ export const failOwnAssignment = async (
       }),
     );
   });
+
+  await runDispatchRecoverySafely(failedAssignment.emergencyId, 'TRIP_FAILED');
+
+  return failedAssignment;
 };

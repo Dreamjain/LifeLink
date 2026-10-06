@@ -534,9 +534,13 @@ const run = async (): Promise<void> => {
     failState.ambulance.status,
   );
   check('the driver is released', failState.driver.availabilityStatus === 'AVAILABLE');
+  // Task 1.24 supersedes the original 1.22 expectations here ("emergency unchanged", "no
+  // replacement"): dispatch recovery now returns the emergency to BED_RESERVED after a failure.
+  // The bystander hospital owns no other ambulance, so automatic re-dispatch finds nothing and the
+  // emergency rests at BED_RESERVED (decision D8) instead of being re-dispatched.
   check(
-    'the emergency status is unchanged by the failure',
-    failState.emergency.currentStatus === 'DRIVER_EN_ROUTE',
+    'Task 1.24 recovery returned the emergency to BED_RESERVED',
+    failState.emergency.currentStatus === 'BED_RESERVED',
     failState.emergency.currentStatus,
   );
   check(
@@ -546,7 +550,7 @@ const run = async (): Promise<void> => {
     })) === 1,
   );
   check(
-    'no replacement assignment is created',
+    'no replacement assignment without an unused ambulance at the bystander hospital',
     (await prisma.ambulanceAssignment.count({ where: { emergencyId: emergencyTwoId } })) === 1,
   );
 

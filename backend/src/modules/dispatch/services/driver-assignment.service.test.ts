@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import {
   AmbulanceAssignmentStatus,
   AmbulanceStatus,
+  BedStatus,
   DriverAvailability,
   EmergencyStatus,
   HospitalResponseStatus,
@@ -397,7 +398,11 @@ describe('rejectOwnAssignment', () => {
     expect(stored.attemptNumber).toBe(1);
   });
 
-  it('creates no replacement attempt and no emergency transition', async () => {
+  // Task 1.24 supersedes the 1.22 rule that a rejection never leads to a replacement attempt:
+  // dispatch recovery now runs after the rejection commits. This fixture holds no bed reservation,
+  // so recovery stops safely (decision D11) and the emergency is left exactly as the rejection
+  // left it. Re-dispatch with a reservation is covered in dispatch-recovery.service.test.ts.
+  it('without a bed reservation, recovery creates no replacement attempt and no transition', async () => {
     const offer = await seedOffer();
     await rejectOwnAssignment(offer.driver.userId, offer.assignment.id, 'Vehicle fault');
 
@@ -496,26 +501,52 @@ describe('driver response concurrency', () => {
 });
 
 describe('re-dispatch after rejection', () => {
+  // Task 1.24: rejection is followed by dispatch recovery, which returns the emergency to
+  // BED_RESERVED. This hospital owns no other ambulance, so automatic re-dispatch finds nothing
+  // and the emergency rests at BED_RESERVED (decision D8), where the hospital's manual dispatch —
+  // which may reuse the released resources — creates attempt 2.
   it('allows a new attempt with the released resources and preserves the first attempt', async () => {
     const offer = await seedOffer();
+    const bed = await prisma.bed.create({
+      data: {
+        hospitalId: offer.scope.hospitalId,
+        bedCode: `B-${randomUUID().slice(0, 8)}`,
+        status: BedStatus.RESERVED,
+      },
+    });
+    await prisma.bedReservation.create({
+      data: {
+        emergencyId: offer.seed.emergency.id,
+        hospitalResponseId: offer.seed.response.id,
+        bedId: bed.id,
+      },
+    });
+
     await rejectOwnAssignment(offer.driver.userId, offer.assignment.id, 'Vehicle fault');
 
-    // The emergency now rests in PENDING_DRIVER_ACCEPTANCE, which the dispatch layer
-    // deliberately does not accept as a source state: re-dispatch is orchestration work.
-    await expect(
-      createAssignment(
-        offer.scope,
-        offer.seed.emergency.id,
-        { ambulanceId: offer.ambulance.id, driverId: offer.driver.profile.id },
-        offer.actorUserId,
-      ),
-    ).rejects.toMatchObject({ code: 'EMERGENCY_STATUS_CONFLICT', statusCode: 409 });
+    expect(
+      (
+        await prisma.emergencyRequest.findUniqueOrThrow({
+          where: { id: offer.seed.emergency.id },
+        })
+      ).currentStatus,
+    ).toBe(EmergencyStatus.BED_RESERVED);
+
+    const second = await createAssignment(
+      offer.scope,
+      offer.seed.emergency.id,
+      { ambulanceId: offer.ambulance.id, driverId: offer.driver.profile.id },
+      offer.actorUserId,
+    );
+    expect(second.attemptNumber).toBe(2);
 
     const stored = await prisma.ambulanceAssignment.findMany({
       where: { emergencyId: offer.seed.emergency.id },
+      orderBy: { attemptNumber: 'asc' },
     });
-    expect(stored).toHaveLength(1);
+    expect(stored).toHaveLength(2);
     expect(stored[0]!.status).toBe(AmbulanceAssignmentStatus.REJECTED);
+    expect(stored[1]!.status).toBe(AmbulanceAssignmentStatus.OFFERED);
   });
 });
 
@@ -928,12 +959,16 @@ describe('failOwnAssignment', () => {
     return offer;
   };
 
+  // Task 1.24 supersedes the 1.22 rule that a failure never leads to a replacement attempt: dispatch
+  // recovery runs after the failure commits. These fixtures hold no bed reservation, so recovery
+  // stops safely (decision D11) and the emergency keeps the status the trip had reached. Re-dispatch
+  // after a failure is covered in dispatch-recovery.service.test.ts.
   it.each([
     ['EN_ROUTE', 'START' as const, EmergencyStatus.DRIVER_EN_ROUTE],
     ['AT_PICKUP', 'ARRIVE_PICKUP' as const, EmergencyStatus.AT_PICKUP],
     ['TRANSPORTING', 'START_TRANSPORT' as const, EmergencyStatus.TRANSPORTING],
   ])(
-    'fails a trip from %s, releases both resources and leaves the emergency alone',
+    'fails a trip from %s and releases both resources; without a reservation recovery stops',
     async (_label, through, expectedEmergencyStatus) => {
       const offer = await walkTo(through);
       const historyBefore = await prisma.emergencyStatusHistory.count({
@@ -967,7 +1002,7 @@ describe('failOwnAssignment', () => {
           .availabilityStatus,
       ).toBe(DriverAvailability.AVAILABLE);
 
-      // The emergency keeps the status the trip had reached: no transition, no escalation.
+      // No reservation, so recovery stopped: no transition, no escalation.
       const emergency = await prisma.emergencyRequest.findUniqueOrThrow({
         where: { id: offer.seed.emergency.id },
       });
@@ -978,7 +1013,7 @@ describe('failOwnAssignment', () => {
         }),
       ).toBe(historyBefore);
 
-      // No replacement attempt is created.
+      // No replacement attempt is created without a reservation to dispatch towards.
       expect(
         await prisma.ambulanceAssignment.count({
           where: { emergencyId: offer.seed.emergency.id },
@@ -987,6 +1022,8 @@ describe('failOwnAssignment', () => {
     },
   );
 
+  // With a reservation, Task 1.24 recovery runs and returns the emergency to BED_RESERVED, but the
+  // reservation itself is still never released.
   it('leaves the bed reservation untouched', async () => {
     const offer = await walkTo('START_TRANSPORT');
     const bed = await prisma.bed.create({

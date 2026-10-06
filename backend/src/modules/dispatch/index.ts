@@ -12,3 +12,4 @@ export {
   rejectAssignment as rejectDriverAssignment,
 } from './controllers/driver-assignment.controller.js';
 export type { DriverContext } from './types/dispatch.types.js';
+export { startDispatchTimeoutSweep } from './services/dispatch-timeout.service.js';
