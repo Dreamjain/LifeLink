@@ -1,0 +1,36 @@
+{
+  "expo": {
+    "name": "LifeLink",
+    "slug": "lifelink-patient",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "scheme": "lifelink-patient",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "in.lifelink.patient",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "LifeLink uses your location so an ambulance can be sent to you when you raise an emergency.",
+        "NSAppTransportSecurity": { "NSAllowsLocalNetworking": true }
+      }
+    },
+    "android": {
+      "package": "in.lifelink.patient",
+      "edgeToEdgeEnabled": true,
+      "usesCleartextTraffic": true,
+      "permissions": ["ACCESS_COARSE_LOCATION", "ACCESS_FINE_LOCATION"]
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "LifeLink uses your location so an ambulance can be sent to you when you raise an emergency."
+        }
+      ]
+    ],
+    "extra": {
+      "apiBaseUrl": null
+    }
+  }
+}

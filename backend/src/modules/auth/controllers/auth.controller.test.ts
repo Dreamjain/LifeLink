@@ -227,6 +227,107 @@ describe('auth.controller login', () => {
   });
 });
 
+describe('auth.controller login for a PENDING patient (Task 1.25 onboarding)', () => {
+  it('a registered patient can log in again and resume onboarding over HTTP', async () => {
+    const phone = randomTestPhone();
+    const password = 'a-very-strong-passphrase';
+
+    // 1. Register. The account is PATIENT/PENDING and the response carries a token.
+    const registerRes = buildRes();
+    await register(
+      buildReq({ phone, password, displayName: 'Pending Onboarding Patient' }),
+      registerRes,
+      vi.fn(),
+    );
+    expect(registerRes.status).toHaveBeenCalledWith(201);
+    const registered = jsonPayload(registerRes) as { user: { id: string; status: string } };
+    expect(registered.user.status).toBe(UserStatus.PENDING);
+
+    // 2. Log in again with the same credentials — this is what used to fail with 403 and left a
+    //    PENDING patient unable to finish the onboarding that would make them approvable.
+    const loginRes = buildRes();
+    const loginNext = vi.fn();
+    await login(buildReq({ phone, password }), loginRes, loginNext);
+
+    expect(loginNext).not.toHaveBeenCalled();
+    expect(loginRes.status).toHaveBeenCalledWith(200);
+    const loggedIn = jsonPayload(loginRes) as {
+      accessToken: string;
+      tokenType: string;
+      user: { id: string; status: string; role: string };
+    };
+    expect(loggedIn.tokenType).toBe('Bearer');
+    expect(loggedIn.user.id).toBe(registered.user.id);
+    expect(loggedIn.user.status).toBe(UserStatus.PENDING);
+    expect(loggedIn.user.role).toBe(UserRole.PATIENT);
+    expect(loggedIn.user).not.toHaveProperty('passwordHash');
+
+    // 3. The login token opens the onboarding routes...
+    const onboardingReq = buildAuthHeaderReq(`Bearer ${loggedIn.accessToken}`);
+    const onboardingNext = vi.fn();
+    await requirePatientOnboardingAuth(onboardingReq, buildRes(), onboardingNext);
+    expect(onboardingNext).toHaveBeenCalledWith();
+
+    const profileRes = buildRes();
+    await getPatientProfile(onboardingReq, profileRes, vi.fn());
+    expect(profileRes.status).toHaveBeenCalledWith(200);
+    expect(jsonPayload(profileRes)).toEqual({ profile: null });
+
+    // 4. ...and nothing else. The ACTIVE-only guard is unchanged.
+    const activeReq = buildAuthHeaderReq(`Bearer ${loggedIn.accessToken}`);
+    const activeNext = vi.fn();
+    await requireAuth(activeReq, buildRes(), activeNext);
+    expect(activeNext).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'INACTIVE_ACCOUNT', statusCode: 403 }),
+    );
+  });
+
+  it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED, UserStatus.REJECTED])(
+    'refuses a %s patient over HTTP',
+    async (status) => {
+      const password = 'a-very-strong-passphrase';
+      const user = await prisma.user.create({
+        data: {
+          phone: randomTestPhone(),
+          email: `test.${randomUUID()}@example.com`,
+          passwordHash: await hashPassword(password),
+          role: UserRole.PATIENT,
+          status,
+          displayName: 'Blocked Login Test User',
+        },
+      });
+      const next = vi.fn();
+
+      await login(buildReq({ phone: user.phone, password }), buildRes(), next);
+
+      expect(next).toHaveBeenCalledWith(
+        expect.objectContaining({ code: 'INACTIVE_ACCOUNT', statusCode: 403 }),
+      );
+    },
+  );
+
+  it('refuses a PENDING driver over HTTP', async () => {
+    const password = 'a-very-strong-passphrase';
+    const user = await prisma.user.create({
+      data: {
+        phone: randomTestPhone(),
+        email: `test.${randomUUID()}@example.com`,
+        passwordHash: await hashPassword(password),
+        role: UserRole.DRIVER,
+        status: UserStatus.PENDING,
+        displayName: 'Pending Driver',
+      },
+    });
+    const next = vi.fn();
+
+    await login(buildReq({ phone: user.phone, password }), buildRes(), next);
+
+    expect(next).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'INACTIVE_ACCOUNT', statusCode: 403 }),
+    );
+  });
+});
+
 describe('auth.controller me', () => {
   it('returns the authenticated user without passwordHash', async () => {
     const user = await prisma.user.create({

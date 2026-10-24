@@ -22,6 +22,9 @@
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "devDependencies": {
-    "prettier": "^3.9.6"
+    "prettier": "^3.9.6",
+    "react": "19.2.3",
+    "react-native": "0.86.3",
+    "test-renderer": "1.2.0"
   }
 }

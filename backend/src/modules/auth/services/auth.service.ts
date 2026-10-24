@@ -27,6 +27,24 @@ export interface LoginResult {
 // Not a real credential; keeps login on the same bcrypt-compare path for unknown phones (no existence oracle).
 const DUMMY_PASSWORD_HASH = '$2b$12$GN/dDZsvWDvh2kELfg42WOdUB3/XwInVBOsWoe6DfZDv9W0RjIerm';
 
+/**
+ * Whether an account may obtain an access token at all.
+ *
+ * ACTIVE is the normal case. A PENDING PATIENT is admitted as well, because a patient's account
+ * only becomes approvable once they have completed their profile and added an emergency contact,
+ * and those routes sit behind `requirePatientOnboardingAuth`. Without this, a patient whose first
+ * registration token expired could never log back in to finish onboarding, and could therefore
+ * never be approved.
+ *
+ * This is not a privilege escalation. `requireAuth` still resolves principals through
+ * `loadActivePrincipalFromClaims`, which admits ACTIVE accounts only, so a PENDING patient's token
+ * opens the onboarding routes and nothing else — emergency creation, driver and hospital surfaces
+ * and every admin route stay closed to it. Every other role, and every other status, keeps the 403.
+ */
+const canAuthenticate = (user: User): boolean =>
+  user.status === UserStatus.ACTIVE ||
+  (user.status === UserStatus.PENDING && user.role === UserRole.PATIENT);
+
 const toSafeUser = (user: User): SafeUser => ({
   id: user.id,
   phone: user.phone,
@@ -89,7 +107,7 @@ export const login = async (input: LoginInput): Promise<LoginResult> => {
     throw new AppError('INVALID_CREDENTIALS', 'Invalid phone number or password.', 401);
   }
 
-  if (user.status !== UserStatus.ACTIVE) {
+  if (!canAuthenticate(user)) {
     throw new AppError('INACTIVE_ACCOUNT', 'This account is not active.', 403);
   }
 

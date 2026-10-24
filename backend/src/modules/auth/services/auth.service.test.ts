@@ -188,17 +188,88 @@ describe('auth.service', () => {
       });
     });
 
-    it.each([
-      UserStatus.SUSPENDED,
-      UserStatus.DEACTIVATED,
-      UserStatus.REJECTED,
-      UserStatus.PENDING,
-    ])('rejects a %s account with INACTIVE_ACCOUNT', async (status) => {
-      const { user, password } = await createUser({ status });
+    it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED, UserStatus.REJECTED])(
+      'rejects a %s account with INACTIVE_ACCOUNT',
+      async (status) => {
+        const { user, password } = await createUser({ status });
 
-      await expect(login({ phone: user.phone, password })).rejects.toMatchObject({
+        await expect(login({ phone: user.phone, password })).rejects.toMatchObject({
+          code: 'INACTIVE_ACCOUNT',
+        });
+      },
+    );
+  });
+
+  describe('login for a PENDING patient (Task 1.25 onboarding)', () => {
+    it('lets a PENDING patient authenticate so they can finish onboarding', async () => {
+      const { user, password } = await createUser({
+        status: UserStatus.PENDING,
+        role: UserRole.PATIENT,
+      });
+
+      const result = await login({ phone: user.phone, password });
+
+      expect(result.accessToken).toBeTypeOf('string');
+      expect(result.tokenType).toBe('Bearer');
+      expect(result.expiresIn).toBeGreaterThan(0);
+      expect(result.user).toMatchObject({
+        id: user.id,
+        role: UserRole.PATIENT,
+        status: UserStatus.PENDING,
+      });
+      expect(result.user).not.toHaveProperty('passwordHash');
+    });
+
+    it('issues a token the onboarding loader accepts and the ACTIVE-only loader rejects', async () => {
+      const { user, password } = await createUser({
+        status: UserStatus.PENDING,
+        role: UserRole.PATIENT,
+      });
+
+      const result = await login({ phone: user.phone, password });
+      const claims = verifyAccessToken(result.accessToken);
+
+      // The middleware separation is the whole safety argument for this change: the onboarding
+      // routes open, and nothing else does.
+      await expect(loadOnboardingPrincipalFromClaims(claims)).resolves.toMatchObject({
+        userId: user.id,
+        role: UserRole.PATIENT,
+      });
+      await expect(loadActivePrincipalFromClaims(claims)).rejects.toMatchObject({
         code: 'INACTIVE_ACCOUNT',
       });
+    });
+
+    it.each([UserRole.DRIVER, UserRole.HOSPITAL_STAFF, UserRole.ADMIN])(
+      'still refuses a PENDING %s',
+      async (role) => {
+        const { user, password } = await createUser({ status: UserStatus.PENDING, role });
+
+        await expect(login({ phone: user.phone, password })).rejects.toMatchObject({
+          code: 'INACTIVE_ACCOUNT',
+          statusCode: 403,
+        });
+      },
+    );
+
+    it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED, UserStatus.REJECTED])(
+      'still refuses a %s patient',
+      async (status) => {
+        const { user, password } = await createUser({ status, role: UserRole.PATIENT });
+
+        await expect(login({ phone: user.phone, password })).rejects.toMatchObject({
+          code: 'INACTIVE_ACCOUNT',
+          statusCode: 403,
+        });
+      },
+    );
+
+    it('still refuses a PENDING patient who gives the wrong password', async () => {
+      const { user } = await createUser({ status: UserStatus.PENDING, role: UserRole.PATIENT });
+
+      await expect(
+        login({ phone: user.phone, password: 'not-the-password' }),
+      ).rejects.toMatchObject({ code: 'INVALID_CREDENTIALS', statusCode: 401 });
     });
   });
 
