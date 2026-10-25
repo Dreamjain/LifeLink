@@ -51,14 +51,21 @@ export const ProfileSetupScreen = ({ navigation }: Props) => {
   const [postalCode, setPostalCode] = useState('');
 
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [loadStatus, setLoadStatus] = useState<'loading' | 'loaded' | 'failed'>('loading');
   const [busy, setBusy] = useState(false);
 
   // Prefill from whatever is already saved, so returning to this step does not blank it out.
   const load = useCallback(async (): Promise<void> => {
+    setLoadStatus('loading');
+    setLoadError(null);
+
     try {
       const { profile } = await getProfile(token);
 
       if (profile === null) {
+        setLoadStatus('loaded');
+
         return;
       }
 
@@ -71,9 +78,14 @@ export const ProfileSetupScreen = ({ navigation }: Props) => {
       setCity(profile.city ?? '');
       setState(profile.state ?? '');
       setPostalCode(profile.postalCode ?? '');
-    } catch {
-      // A profile that cannot be read is not worth blocking onboarding over: the patient simply
-      // starts from empty fields and the save below overwrites whatever is there.
+      setLoadStatus('loaded');
+    } catch (caught) {
+      setLoadStatus('failed');
+      setLoadError(
+        caught instanceof ApiError
+          ? caught.displayMessage
+          : 'Could not load your saved details. Retry before saving to avoid overwriting them.',
+      );
     }
   }, [token]);
 
@@ -125,6 +137,27 @@ export const ProfileSetupScreen = ({ navigation }: Props) => {
     >
       {error === null ? null : (
         <MessageBanner tone="error" message={error} testID="profile-error" />
+      )}
+      {loadStatus === 'loading' ? (
+        <MessageBanner
+          tone="info"
+          message="Loading your saved details..."
+          testID="profile-loading"
+        />
+      ) : null}
+      {loadError === null ? null : (
+        <>
+          <MessageBanner tone="error" message={loadError} testID="profile-load-error" />
+          <PrimaryButton
+            label="Retry loading your details"
+            variant="secondary"
+            onPress={() => {
+              void load();
+            }}
+            busy={loadStatus === 'loading'}
+            testID="profile-load-retry"
+          />
+        </>
       )}
 
       <Text style={styles.groupLabel}>Blood group</Text>
@@ -197,6 +230,7 @@ export const ProfileSetupScreen = ({ navigation }: Props) => {
           void submit();
         }}
         busy={busy}
+        disabled={loadStatus !== 'loaded'}
         testID="profile-submit"
       />
       <View style={styles.footer}>

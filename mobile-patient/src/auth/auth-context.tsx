@@ -103,8 +103,9 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
   }, []);
 
-  // Restore on launch. A stored session is trusted without a network round trip, so the app is
-  // usable offline up to the first request; the token is only ever proved by using it.
+  // Reconcile ACTIVE sessions before mounting the active navigator. A transient network/server
+  // failure falls back to the cached session for offline use; only a definitive auth rejection
+  // invalidates it. PENDING sessions intentionally skip /auth/me, which requires ACTIVE status.
   useEffect(() => {
     let cancelled = false;
 
@@ -133,8 +134,33 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
         return;
       }
 
-      setSession(stored);
-      setStatus(nextStatus);
+      let restored = stored;
+
+      if (nextStatus === 'active') {
+        try {
+          const { user } = await getCurrentUser(stored.accessToken);
+          restored = { ...stored, user };
+          await saveSession(restored);
+        } catch (error) {
+          if (error instanceof ApiError && (error.isAuthFailure || error.isInactiveAccount)) {
+            await clearSession();
+
+            if (!cancelled && mounted.current) {
+              setSession(null);
+              setStatus('unauthenticated');
+            }
+
+            return;
+          }
+          // Network and server failures do not prove that an account is disabled. Keep the
+          // encrypted cached session usable and let its next request retry the connection.
+        }
+      }
+
+      if (!cancelled && mounted.current) {
+        setSession(restored);
+        setStatus(statusFor(restored.user));
+      }
     };
 
     void restore();
@@ -148,14 +174,16 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   // token itself is invalid or expired, which signs the patient out once instead of leaving each
   // screen to discover the failure separately.
   useEffect(() => {
-    setAuthFailureListener(() => {
-      void signOut();
+    setAuthFailureListener((error) => {
+      if (error.isAuthFailure || (error.isInactiveAccount && session?.user.status === 'ACTIVE')) {
+        void signOut();
+      }
     });
 
     return () => {
       setAuthFailureListener(null);
     };
-  }, [signOut]);
+  }, [session, signOut]);
 
   const signIn = useCallback(
     async (phone: string, password: string): Promise<void> => {
@@ -191,16 +219,24 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
 
       await adopt({ accessToken: session.accessToken, user });
     } catch (error) {
-      // 403 INACTIVE_ACCOUNT is the expected answer for a patient who is still PENDING: the
-      // account is intact and the session must survive. A 401 is handled by the auth-failure
-      // listener above, so nothing else has to be done here either.
-      if (error instanceof ApiError && (error.status === 403 || error.isAuthFailure)) {
+      // A pending patient is expected to receive INACTIVE_ACCOUNT from /auth/me; preserve that
+      // onboarding session. The same response for a cached ACTIVE account is definitive and
+      // invalidates it. 401s are cleared by the shared listener; network failures remain visible.
+      if (error instanceof ApiError && error.isInactiveAccount) {
+        if (session.user.status === 'ACTIVE') {
+          await signOut();
+        }
+
+        return;
+      }
+
+      if (error instanceof ApiError && error.isAuthFailure) {
         return;
       }
 
       throw error;
     }
-  }, [adopt, session]);
+  }, [adopt, session, signOut]);
 
   const value = useMemo<AuthContextValue>(
     () => ({

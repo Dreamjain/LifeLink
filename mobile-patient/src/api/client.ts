@@ -12,7 +12,7 @@ export interface RequestOptions {
 }
 
 /** Invoked whenever the backend rejects the token, so the session can be cleared exactly once. */
-type AuthFailureListener = () => void;
+type AuthFailureListener = (error: ApiError) => void;
 
 let authFailureListener: AuthFailureListener | null = null;
 
@@ -137,8 +137,8 @@ export const request = async <T>(path: string, options: RequestOptions = {}): Pr
       issues: parseIssues(envelope?.details),
     });
 
-    if (error.isAuthFailure) {
-      authFailureListener?.();
+    if (error.isAuthFailure || error.isInactiveAccount) {
+      authFailureListener?.(error);
     }
 
     throw error;

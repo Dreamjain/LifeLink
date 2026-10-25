@@ -1,6 +1,9 @@
+import { Pressable, Text } from 'react-native';
 import { screen, userEvent, waitFor } from '@testing-library/react-native';
 import * as SecureStore from 'expo-secure-store';
-import { AuthProvider } from '../src/auth/auth-context';
+import { AuthProvider, useAuth } from '../src/auth/auth-context';
+import { ApiError } from '../src/api/api-error';
+import { getCurrentUser } from '../src/api/endpoints';
 import { RootNavigator } from '../src/navigation/root-navigator';
 import { renderWithProviders } from '../src/test-support/render';
 import type { ApiUser, UserStatus } from '../src/types/api.types';
@@ -28,6 +31,7 @@ const store = new Map<string, string>();
 const getItemAsync = SecureStore.getItemAsync as jest.Mock;
 const setItemAsync = SecureStore.setItemAsync as jest.Mock;
 const deleteItemAsync = SecureStore.deleteItemAsync as jest.Mock;
+const getCurrentUserMock = getCurrentUser as jest.MockedFunction<typeof getCurrentUser>;
 
 const storedUser = (status: UserStatus): ApiUser => ({
   id: 'user-1',
@@ -56,6 +60,8 @@ beforeEach(() => {
   deleteItemAsync.mockImplementation(async (key: string) => {
     store.delete(key);
   });
+  getCurrentUserMock.mockReset();
+  getCurrentUserMock.mockResolvedValue({ user: storedUser('ACTIVE') });
 });
 
 const renderApp = () =>
@@ -64,6 +70,24 @@ const renderApp = () =>
       <RootNavigator />
     </AuthProvider>,
   );
+
+const AccountRefreshProbe = () => {
+  const { refreshAccount, status } = useAuth();
+
+  return (
+    <>
+      <Text testID="auth-status">{status}</Text>
+      <Pressable
+        testID="refresh-account"
+        onPress={() => {
+          void refreshAccount();
+        }}
+      >
+        <Text>Refresh account</Text>
+      </Pressable>
+    </>
+  );
+};
 
 describe('the auth gate', () => {
   it('shows the sign-in screen when no session is stored', async () => {
@@ -91,7 +115,73 @@ describe('the auth gate', () => {
     await renderApp();
 
     expect(await screen.findByTestId('sos-button')).toBeOnTheScreen();
+    expect(getCurrentUserMock).toHaveBeenCalledWith('stored-token');
     expect(screen.queryByText('Sign in')).toBeNull();
+  });
+
+  it('invalidates an ACTIVE stored session when the backend says the account is inactive', async () => {
+    seedSession('ACTIVE');
+    getCurrentUserMock.mockRejectedValue(
+      new ApiError({
+        code: 'INACTIVE_ACCOUNT',
+        message: 'This account is not active.',
+        status: 403,
+      }),
+    );
+
+    await renderApp();
+
+    expect(await screen.findByRole('header', { name: 'Sign in' })).toBeOnTheScreen();
+    await waitFor(() => {
+      expect(deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY);
+      expect(deleteItemAsync).toHaveBeenCalledWith(USER_KEY);
+    });
+  });
+
+  it('preserves a PENDING session when /auth/me reports INACTIVE_ACCOUNT', async () => {
+    seedSession('PENDING');
+    getCurrentUserMock.mockRejectedValue(
+      new ApiError({
+        code: 'INACTIVE_ACCOUNT',
+        message: 'This account is not active.',
+        status: 403,
+      }),
+    );
+
+    const interaction = userEvent.setup();
+    await renderWithProviders(
+      <AuthProvider>
+        <AccountRefreshProbe />
+      </AuthProvider>,
+    );
+    await interaction.press(await screen.findByTestId('refresh-account'));
+
+    expect(await screen.findByTestId('auth-status')).toHaveTextContent('onboarding');
+    expect(deleteItemAsync).not.toHaveBeenCalled();
+  });
+
+  it('clears an ACTIVE session when the backend rejects its token', async () => {
+    seedSession('ACTIVE');
+    getCurrentUserMock.mockRejectedValue(
+      new ApiError({ code: 'TOKEN_EXPIRED', message: 'Expired.', status: 401 }),
+    );
+
+    await renderApp();
+
+    expect(await screen.findByRole('header', { name: 'Sign in' })).toBeOnTheScreen();
+    await waitFor(() => expect(deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY));
+  });
+
+  it('keeps the cached ACTIVE session on a transient network failure', async () => {
+    seedSession('ACTIVE');
+    getCurrentUserMock.mockRejectedValue(
+      new ApiError({ code: 'NETWORK_ERROR', message: 'Offline.', status: 0 }),
+    );
+
+    await renderApp();
+
+    expect(await screen.findByTestId('sos-button')).toBeOnTheScreen();
+    expect(deleteItemAsync).not.toHaveBeenCalled();
   });
 
   it('ignores a stored session whose account could no longer authenticate', async () => {

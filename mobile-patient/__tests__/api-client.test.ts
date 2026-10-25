@@ -181,7 +181,7 @@ describe('api client request', () => {
     expect(listener).toHaveBeenCalledTimes(1);
   });
 
-  it('does not sign the patient out for a 403, which is how a PENDING account answers', async () => {
+  it('reports INACTIVE_ACCOUNT separately from invalid-token 401 failures', async () => {
     const listener = jest.fn();
 
     setAuthFailureListener(listener);
@@ -200,8 +200,10 @@ describe('api client request', () => {
 
       expect(error.status).toBe(403);
       expect(error.isAuthFailure).toBe(false);
+      expect(error.isInactiveAccount).toBe(true);
     }
 
-    expect(listener).not.toHaveBeenCalled();
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener.mock.calls[0]?.[0]).toMatchObject({ code: 'INACTIVE_ACCOUNT' });
   });
 });

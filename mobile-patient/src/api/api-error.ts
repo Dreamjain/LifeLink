@@ -40,6 +40,11 @@ export class ApiError extends Error {
     );
   }
 
+  /** The token is valid, but the backend has disabled this account. */
+  get isInactiveAccount(): boolean {
+    return this.status === 403 && this.code === 'INACTIVE_ACCOUNT';
+  }
+
   /** The request never reached the backend. The most common cause is a wrong base URL. */
   get isNetworkFailure(): boolean {
     return this.code === 'NETWORK_ERROR';
