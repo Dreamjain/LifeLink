@@ -8,6 +8,7 @@ import { verifyAccessToken } from '../utils/jwt.util.js';
 import { loadOnboardingPrincipalFromClaims } from '../../patients/services/patient.service.js';
 import {
   getCurrentUser,
+  getPatientAccountStatus,
   loadActivePrincipalFromClaims,
   login,
   registerPatient,
@@ -188,7 +189,7 @@ describe('auth.service', () => {
       });
     });
 
-    it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED, UserStatus.REJECTED])(
+    it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED])(
       'rejects a %s account with INACTIVE_ACCOUNT',
       async (status) => {
         const { user, password } = await createUser({ status });
@@ -198,6 +199,21 @@ describe('auth.service', () => {
         });
       },
     );
+
+    it('reports rejection only after valid credentials are verified', async () => {
+      const { user, password } = await createUser({ status: UserStatus.REJECTED });
+
+      await expect(login({ phone: user.phone, password })).rejects.toMatchObject({
+        code: 'ACCOUNT_REJECTED',
+        statusCode: 403,
+      });
+      await expect(
+        login({ phone: user.phone, password: 'incorrect-password' }),
+      ).rejects.toMatchObject({
+        code: 'INVALID_CREDENTIALS',
+        statusCode: 401,
+      });
+    });
   });
 
   describe('login for a PENDING patient (Task 1.25 onboarding)', () => {
@@ -252,7 +268,7 @@ describe('auth.service', () => {
       },
     );
 
-    it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED, UserStatus.REJECTED])(
+    it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED])(
       'still refuses a %s patient',
       async (status) => {
         const { user, password } = await createUser({ status, role: UserRole.PATIENT });
@@ -312,6 +328,35 @@ describe('auth.service', () => {
 
       expect(safeUser.id).toBe(user.id);
       expect(safeUser).not.toHaveProperty('passwordHash');
+    });
+  });
+
+  describe('getPatientAccountStatus', () => {
+    it.each([UserStatus.PENDING, UserStatus.ACTIVE, UserStatus.REJECTED])(
+      'returns the caller patient status %s',
+      async (status) => {
+        const { user } = await createUser({ status, role: UserRole.PATIENT });
+
+        await expect(getPatientAccountStatus(user.id)).resolves.toBe(status);
+      },
+    );
+
+    it('does not expose status for non-patient roles', async () => {
+      const { user } = await createUser({ status: UserStatus.ACTIVE, role: UserRole.DRIVER });
+
+      await expect(getPatientAccountStatus(user.id)).rejects.toMatchObject({
+        code: 'INSUFFICIENT_ROLE',
+        statusCode: 403,
+      });
+    });
+
+    it('does not expose suspended account status', async () => {
+      const { user } = await createUser({ status: UserStatus.SUSPENDED });
+
+      await expect(getPatientAccountStatus(user.id)).rejects.toMatchObject({
+        code: 'INACTIVE_ACCOUNT',
+        statusCode: 403,
+      });
     });
   });
 });

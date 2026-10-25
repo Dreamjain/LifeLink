@@ -10,12 +10,17 @@ import {
 } from 'react';
 import { ApiError } from '../api/api-error';
 import { setAuthFailureListener } from '../api/client';
-import { getCurrentUser, login as loginRequest, registerPatient } from '../api/endpoints';
+import {
+  getCurrentUser,
+  getPatientAccountStatus,
+  login as loginRequest,
+  registerPatient,
+} from '../api/endpoints';
 import type { ApiUser } from '../types/api.types';
 import { clearSession, loadSession, saveSession, type StoredSession } from './session';
 
 /**
- * The three states the app can be in, plus the moment before the stored session has been read.
+ * The four account states the app can be in, plus the moment before the stored session is read.
  *
  * `onboarding` is a PENDING patient: they hold a valid token, they may finish their profile and
  * add an emergency contact, and they may not raise an emergency until an administrator approves
@@ -23,7 +28,7 @@ import { clearSession, loadSession, saveSession, type StoredSession } from './se
  * `requireAuth`); the navigator mirrors it so the patient is never shown a control that would
  * fail with a 403.
  */
-export type AuthStatus = 'restoring' | 'unauthenticated' | 'onboarding' | 'active';
+export type AuthStatus = 'restoring' | 'unauthenticated' | 'onboarding' | 'rejected' | 'active';
 
 export interface RegisterInput {
   displayName: string;
@@ -40,9 +45,8 @@ export interface AuthContextValue {
   signUp: (input: RegisterInput) => Promise<void>;
   signOut: () => Promise<void>;
   /**
-   * Re-reads the account from the backend. A PENDING patient uses this to find out whether an
-   * administrator has approved them: `GET /auth/me` answers 403 INACTIVE_ACCOUNT while they are
-   * still pending and 200 once they are ACTIVE.
+   * Re-reads the account from the backend. A pending patient uses the status-only endpoint to
+   * distinguish waiting, approval and rejection without broadening the active-only `/auth/me`.
    */
   refreshAccount: () => Promise<void>;
 }
@@ -50,6 +54,10 @@ export interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 const statusFor = (user: ApiUser): AuthStatus => {
+  if (user.role === 'PATIENT' && user.status === 'REJECTED') {
+    return 'rejected';
+  }
+
   if (user.status === 'ACTIVE') {
     return 'active';
   }
@@ -57,6 +65,25 @@ const statusFor = (user: ApiUser): AuthStatus => {
   // Only ACTIVE and PENDING patients can obtain a token at all, so anything else here means a
   // stored session that the backend would now refuse. Treat it as signed out.
   return user.status === 'PENDING' ? 'onboarding' : 'unauthenticated';
+};
+
+/** Refreshes a pending patient's cached safe user only when the status endpoint confirms change. */
+const refreshPendingPatientSession = async (stored: StoredSession): Promise<StoredSession> => {
+  const { status } = await getPatientAccountStatus(stored.accessToken);
+
+  if (status === 'PENDING') {
+    return stored;
+  }
+
+  if (status === 'REJECTED') {
+    return { ...stored, user: { ...stored.user, status: 'REJECTED' } };
+  }
+
+  // The status endpoint intentionally returns no user profile. Once ACTIVE is confirmed, use
+  // the existing active-only endpoint to refresh the complete safe user representation.
+  const { user } = await getCurrentUser(stored.accessToken);
+
+  return { ...stored, user };
 };
 
 export const AuthProvider = ({ children }: { children: ReactNode }) => {
@@ -155,6 +182,27 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
           // Network and server failures do not prove that an account is disabled. Keep the
           // encrypted cached session usable and let its next request retry the connection.
         }
+      } else if (nextStatus === 'onboarding' && stored.user.role === 'PATIENT') {
+        try {
+          restored = await refreshPendingPatientSession(stored);
+
+          if (restored !== stored) {
+            await saveSession(restored);
+          }
+        } catch (error) {
+          if (error instanceof ApiError && error.isAuthFailure) {
+            await clearSession();
+
+            if (!cancelled && mounted.current) {
+              setSession(null);
+              setStatus('unauthenticated');
+            }
+
+            return;
+          }
+          // Preserve a pending session on transient failures or an undifferentiated inactive
+          // response. The latter is not proof of rejection; the next status check may retry.
+        }
       }
 
       if (!cancelled && mounted.current) {
@@ -215,13 +263,22 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
     }
 
     try {
+      if (session.user.role === 'PATIENT' && session.user.status === 'PENDING') {
+        await adopt(await refreshPendingPatientSession(session));
+
+        return;
+      }
+
+      if (session.user.status === 'REJECTED') {
+        return;
+      }
+
       const { user } = await getCurrentUser(session.accessToken);
 
       await adopt({ accessToken: session.accessToken, user });
     } catch (error) {
-      // A pending patient is expected to receive INACTIVE_ACCOUNT from /auth/me; preserve that
-      // onboarding session. The same response for a cached ACTIVE account is definitive and
-      // invalidates it. 401s are cleared by the shared listener; network failures remain visible.
+      // A pending patient may receive an undifferentiated inactive response from the status
+      // endpoint. Preserve that session: only the explicit REJECTED status changes its UI.
       if (error instanceof ApiError && error.isInactiveAccount) {
         if (session.user.status === 'ACTIVE') {
           await signOut();

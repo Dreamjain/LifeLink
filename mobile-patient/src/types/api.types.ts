@@ -12,6 +12,9 @@ export type UserRole = 'PATIENT' | 'DRIVER' | 'HOSPITAL_STAFF' | 'ADMIN';
 /** backend/prisma/schema.prisma :: enum UserStatus */
 export type UserStatus = 'PENDING' | 'ACTIVE' | 'SUSPENDED' | 'DEACTIVATED' | 'REJECTED';
 
+/** The statuses exposed by the patient-only account-status endpoint. */
+export type PatientAccountStatus = 'PENDING' | 'ACTIVE' | 'REJECTED';
+
 /** backend/prisma/schema.prisma :: enum EmergencyStatus (all 17 members, in lifecycle order) */
 export type EmergencyStatus =
   | 'CREATED'

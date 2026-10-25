@@ -4,6 +4,7 @@ import type {
   CreateContactInput,
   CreateEmergencyInput,
   EmergencyContact,
+  PatientAccountStatus,
   PatientEmergency,
   PatientProfile,
   UpdateProfileInput,
@@ -27,6 +28,10 @@ export const login = (input: { phone: string; password: string }): Promise<AuthR
 
 export const getCurrentUser = (token: string): Promise<{ user: ApiUser }> =>
   request<{ user: ApiUser }>('/auth/me', { token });
+
+/** Reads only the caller's patient account state, including PENDING and REJECTED. */
+export const getPatientAccountStatus = (token: string): Promise<{ status: PatientAccountStatus }> =>
+  request<{ status: PatientAccountStatus }>('/auth/patient-status', { token });
 
 export const getProfile = (token: string): Promise<{ profile: PatientProfile | null }> =>
   request<{ profile: PatientProfile | null }>('/patients/me', { token });

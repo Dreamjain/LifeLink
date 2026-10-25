@@ -22,23 +22,23 @@ The future auth mechanism is isolated behind an authentication service interface
 
 ## 3. Roles and identity model
 
-| Role | Identity and operational boundary |
-|---|---|
-| `PATIENT` | Own `PatientProfile`, reports, contacts, requests, tracking, and notifications. |
-| `DRIVER` | Own `DriverProfile`, availability, and only current/historical assignments permitted by policy. |
-| `HOSPITAL_STAFF` | Hospital-scoped activity through an active `HospitalStaffMembership`. |
-| `ADMIN` | System-wide administrative oversight; sensitive operations remain attributable. |
+| Role             | Identity and operational boundary                                                               |
+| ---------------- | ----------------------------------------------------------------------------------------------- |
+| `PATIENT`        | Own `PatientProfile`, reports, contacts, requests, tracking, and notifications.                 |
+| `DRIVER`         | Own `DriverProfile`, availability, and only current/historical assignments permitted by policy. |
+| `HOSPITAL_STAFF` | Hospital-scoped activity through an active `HospitalStaffMembership`.                           |
+| `ADMIN`          | System-wide administrative oversight; sensitive operations remain attributable.                 |
 
 `User` holds `phone`, optional `email`, optional future `passwordHash`, `role`, `status`, and `displayName`. Patient data remains in `PatientProfile`; driver-specific data remains in `DriverProfile`; hospital association remains in `HospitalStaffMembership`. Do not duplicate those attributes in `User`.
 
 ## 4. Registration and onboarding strategy
 
-| Role | MVP entry path | Activation condition |
-|---|---|---|
-| Patient | Self-registration with phone, password, and display name; account starts as `PENDING`. | Required profile and at least one emergency contact are completed, then an administrator performs simulated/manual MVP verification and sets the account to `ACTIVE`. |
-| Driver | Registration/application creates a `PENDING` account and a `DriverProfile` with simulated licence details. | Admin verifies driver and changes status to `ACTIVE`; profile verification is `VERIFIED`. |
-| Hospital staff | Controlled hospital invitation or hospital-admin-created account; a staff membership is created as `ACTIVE` only after approval. | `User.role = HOSPITAL_STAFF`, user is `ACTIVE`, and an active membership exists. |
-| Admin | Controlled creation only by an existing authorised admin or a secure development bootstrap process. | Explicit administrative approval; no public registration. |
+| Role           | MVP entry path                                                                                                                   | Activation condition                                                                                                                                                  |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Patient        | Self-registration with phone, password, and display name; account starts as `PENDING`.                                           | Required profile and at least one emergency contact are completed, then an administrator performs simulated/manual MVP verification and sets the account to `ACTIVE`. |
+| Driver         | Registration/application creates a `PENDING` account and a `DriverProfile` with simulated licence details.                       | Admin verifies driver and changes status to `ACTIVE`; profile verification is `VERIFIED`.                                                                             |
+| Hospital staff | Controlled hospital invitation or hospital-admin-created account; a staff membership is created as `ACTIVE` only after approval. | `User.role = HOSPITAL_STAFF`, user is `ACTIVE`, and an active membership exists.                                                                                      |
+| Admin          | Controlled creation only by an existing authorised admin or a secure development bootstrap process.                              | Explicit administrative approval; no public registration.                                                                                                             |
 
 Patient self-registration must not allow a caller to choose another role. Patient activation is a manual/simulated administrative workflow: the application checks required profile/contact completeness and basic consistency, then an administrator verifies the submission before setting `User.status` to `ACTIVE`. No Aadhaar, PAN, voter-ID API, SMS OTP provider, or external identity-verification service is used. The MVP must not claim official government-system verification; actual government identity verification is a future integration. Driver registration must not grant dispatch access before approval. Hospital staff membership must be associated with a hospital through controlled onboarding. Admin role assignment is never client-controlled.
 
@@ -53,7 +53,7 @@ Login accepts normalised phone number and password. The server:
 5. issues a short-lived access token; and
 6. records only safe operational log data (correlation ID, user ID after success, outcome), never a password or token.
 
-For drivers, login may succeed only when the user account is active; dispatch operations additionally require a verified `DriverProfile`. For hospital staff, operational requests additionally require an active membership. This avoids treating login itself as an authorization grant.
+For patients, login may also succeed for `PENDING` accounts so they can complete onboarding; a rejected patient with correct credentials receives a registration-rejected response without an access token. For drivers, login may succeed only when the user account is active; dispatch operations additionally require a verified `DriverProfile`. For hospital staff, operational requests additionally require an active membership. This avoids treating login itself as an authorization grant.
 
 ## 6. Password security
 
@@ -69,16 +69,16 @@ For drivers, login may succeed only when the user account is active; dispatch op
 
 Use a symmetric **HS256** JWT in the MVP with a high-entropy `JWT_SECRET` stored only in environment configuration. HS256 keeps local deployment simple. Move to asymmetric `RS256`/`EdDSA` only when separate signing and verification services or external consumers justify key separation.
 
-| Claim/configuration | Recommendation |
-|---|---|
-| Algorithm | HS256, explicitly allow-list it during verification. |
-| `sub` | Required immutable `User.id` UUID. |
-| `role` | Required `UserRole`; a convenience claim, not the only authorization input. |
-| `jti` | Required random UUID for traceability and future revocation. |
-| `iss` | Required configured issuer, e.g. `lifelink-api`. |
-| `aud` | Required configured audience, e.g. `lifelink-clients`. |
-| `iat`, `exp` | Issued/expiry timestamps; access token lifetime: **15 minutes**. |
-| Header | `Authorization: Bearer <token>` over HTTPS in deployed environments. |
+| Claim/configuration | Recommendation                                                              |
+| ------------------- | --------------------------------------------------------------------------- |
+| Algorithm           | HS256, explicitly allow-list it during verification.                        |
+| `sub`               | Required immutable `User.id` UUID.                                          |
+| `role`              | Required `UserRole`; a convenience claim, not the only authorization input. |
+| `jti`               | Required random UUID for traceability and future revocation.                |
+| `iss`               | Required configured issuer, e.g. `lifelink-api`.                            |
+| `aud`               | Required configured audience, e.g. `lifelink-clients`.                      |
+| `iat`, `exp`        | Issued/expiry timestamps; access token lifetime: **15 minutes**.            |
+| Header              | `Authorization: Bearer <token>` over HTTPS in deployed environments.        |
 
 Never place passwords, password hashes, refresh secrets, medical reports, allergy/medical data, government IDs, emergency details, hospital membership, complete permissions, or contact details in a JWT. Current membership, account state, assignment, and ownership are checked at the request/use-case boundary because they can change before token expiry.
 
@@ -111,14 +111,14 @@ Route-level guards establish an authenticated principal and broad role eligibili
 
 ## 10. Resource-level authorization
 
-| Resource/action | Required policy |
-|---|---|
-| Patient profile, reports, contacts, requests, notifications | `PatientProfile.userId = principal.sub`; ownership is checked in the query/policy. |
-| Emergency tracking | Patient owns the emergency, driver has a permitted assignment, or hospital staff belongs to the applicable hospital; admin has system scope. |
-| Driver profile/availability | `DriverProfile.userId = principal.sub`. |
-| Driver assignment/emergency pickup data | Assignment `driverId` resolves to principal’s `DriverProfile`, and assignment/state policy permits access. |
-| Hospital operations | Principal is `HOSPITAL_STAFF` with active membership for the hospital owning the affected resource or response. |
-| Admin operations | `ADMIN` role plus explicit operation policy; destructive changes require confirmation/audit intent. |
+| Resource/action                                             | Required policy                                                                                                                              |
+| ----------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
+| Patient profile, reports, contacts, requests, notifications | `PatientProfile.userId = principal.sub`; ownership is checked in the query/policy.                                                           |
+| Emergency tracking                                          | Patient owns the emergency, driver has a permitted assignment, or hospital staff belongs to the applicable hospital; admin has system scope. |
+| Driver profile/availability                                 | `DriverProfile.userId = principal.sub`.                                                                                                      |
+| Driver assignment/emergency pickup data                     | Assignment `driverId` resolves to principal’s `DriverProfile`, and assignment/state policy permits access.                                   |
+| Hospital operations                                         | Principal is `HOSPITAL_STAFF` with active membership for the hospital owning the affected resource or response.                              |
+| Admin operations                                            | `ADMIN` role plus explicit operation policy; destructive changes require confirmation/audit intent.                                          |
 
 This prevents IDOR: fetching `/emergencies/{id}` must evaluate the caller’s relationship to that exact emergency, not merely validate that the caller is logged in.
 
@@ -170,9 +170,16 @@ Patient -> submit phone/password/display name
         -> no government-ID, SMS OTP, or external identity-provider verification
 
 Client -> login(phone, password) -> validate credentials
-       -> find User -> bcrypt compare -> active-status check
+       -> find User -> bcrypt compare -> active or pending-patient check
        -> issue 15-minute JWT -> authenticated requests
 ```
+
+An authenticated patient may call `GET /api/v1/auth/patient-status` to read only their own
+`PENDING`, `ACTIVE`, or `REJECTED` status. This narrow status endpoint does not grant profile,
+contact, emergency, or other business access. `GET /api/v1/auth/me` remains active-only; pending
+patients use the status endpoint to learn whether they are still pending, were approved, or were
+rejected. A rejected patient may see this restricted status while an already-issued token remains
+valid; after token expiry, a correct-password login reports rejection without issuing a token.
 
 ### Driver, staff, and admin onboarding
 
@@ -211,17 +218,18 @@ For password reset, the MVP uses controlled admin reset; future verified OTP ena
 
 Use the existing safe error envelope with a correlation ID. Authentication responses must not reveal whether a phone number exists.
 
-| Code | HTTP status | Meaning |
-|---|---:|---|
-| `INVALID_CREDENTIALS` | 401 | Incorrect phone/password or non-disclosing login failure. |
-| `MISSING_TOKEN` | 401 | Bearer token absent. |
-| `MALFORMED_TOKEN` / `INVALID_TOKEN` | 401 | Token cannot be accepted. |
-| `TOKEN_EXPIRED` | 401 | Token is validly formed but expired. |
-| `INACTIVE_ACCOUNT` | 403 | Suspended, deactivated, rejected, or pending account. |
-| `INSUFFICIENT_ROLE` | 403 | Broad role is not permitted. |
-| `RESOURCE_ACCESS_DENIED` | 403 | Ownership or scope policy failed. |
-| `HOSPITAL_SCOPE_DENIED` | 403 | No active membership for target hospital. |
-| `DRIVER_ASSIGNMENT_DENIED` | 403 | Caller lacks the required assignment. |
+| Code                                | HTTP status | Meaning                                                                                                             |
+| ----------------------------------- | ----------: | ------------------------------------------------------------------------------------------------------------------- |
+| `INVALID_CREDENTIALS`               |         401 | Incorrect phone/password or non-disclosing login failure.                                                           |
+| `MISSING_TOKEN`                     |         401 | Bearer token absent.                                                                                                |
+| `MALFORMED_TOKEN` / `INVALID_TOKEN` |         401 | Token cannot be accepted.                                                                                           |
+| `TOKEN_EXPIRED`                     |         401 | Token is validly formed but expired.                                                                                |
+| `INACTIVE_ACCOUNT`                  |         403 | Suspended, deactivated, or otherwise inactive account; `/auth/me` also uses this for pending and rejected accounts. |
+| `ACCOUNT_REJECTED`                  |         403 | Correct credentials for a rejected patient; no token is issued.                                                     |
+| `INSUFFICIENT_ROLE`                 |         403 | Broad role is not permitted.                                                                                        |
+| `RESOURCE_ACCESS_DENIED`            |         403 | Ownership or scope policy failed.                                                                                   |
+| `HOSPITAL_SCOPE_DENIED`             |         403 | No active membership for target hospital.                                                                           |
+| `DRIVER_ASSIGNMENT_DENIED`          |         403 | Caller lacks the required assignment.                                                                               |
 
 For sensitive resource lookups, a generic 404 may be used where revealing existence would be harmful; apply it consistently per resource.
 
@@ -255,8 +263,8 @@ Future refresh/session, OTP, and external identity providers add their own secre
 
 ## 20. MVP versus future authentication
 
-| MVP | Future |
-|---|---|
+| MVP                                                                                                                                            | Future                                                                                                                                                                                                                     |
+| ---------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Phone/password, bcrypt-12, 15-minute HS256 access tokens, role plus resource policies, controlled administrative reset, simulated verification | SMS/WhatsApp OTP, self-service reset, rotating refresh tokens and session/device management, secure web refresh cookies, MFA, OAuth, external identity providers, asymmetric signing, token revocation/session dashboards. |
 
 ## 21. Recommended API boundary (documentation only)

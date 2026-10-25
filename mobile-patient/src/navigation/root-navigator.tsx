@@ -7,6 +7,7 @@ import { HomeScreen } from '../screens/HomeScreen';
 import { LoginScreen } from '../screens/LoginScreen';
 import { PendingApprovalScreen } from '../screens/PendingApprovalScreen';
 import { ProfileSetupScreen } from '../screens/ProfileSetupScreen';
+import { RejectedApprovalScreen } from '../screens/RejectedApprovalScreen';
 import { RegisterScreen } from '../screens/RegisterScreen';
 import { RestoringScreen } from '../screens/RestoringScreen';
 import { colors } from '../theme';
@@ -73,6 +74,10 @@ export const RootNavigator = () => {
         <OnboardingStack.Screen name="EmergencyContacts" component={EmergencyContactsScreen} />
         <OnboardingStack.Screen name="PendingApproval" component={PendingApprovalScreen} />
       </OnboardingStack.Navigator>
+    ) : status === 'rejected' ? (
+      <UnauthenticatedStack.Navigator screenOptions={screenOptions}>
+        <UnauthenticatedStack.Screen name="RejectedApproval" component={RejectedApprovalScreen} />
+      </UnauthenticatedStack.Navigator>
     ) : (
       <ActiveStack.Navigator screenOptions={screenOptions}>
         <ActiveStack.Screen name="Home" component={HomeScreen} />

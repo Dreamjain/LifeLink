@@ -4,6 +4,7 @@ import { AppError } from '../../../common/errors/app-error.js';
 import { parseLoginInput, parseRegisterInput } from '../schemas/auth.schema.js';
 import {
   getCurrentUser,
+  getPatientAccountStatus,
   login as authenticateUser,
   registerPatient,
 } from '../services/auth.service.js';
@@ -44,6 +45,24 @@ export const me = async (req: Request, res: Response, next: NextFunction): Promi
     const user = await getCurrentUser(req.user);
 
     res.status(200).json({ user });
+  } catch (error) {
+    next(error);
+  }
+};
+
+export const patientStatus = async (
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): Promise<void> => {
+  try {
+    if (!req.user) {
+      throw new AppError('MISSING_TOKEN', 'Authentication is required.', 401);
+    }
+
+    const status = await getPatientAccountStatus(req.user.userId);
+
+    res.status(200).json({ status });
   } catch (error) {
     next(error);
   }

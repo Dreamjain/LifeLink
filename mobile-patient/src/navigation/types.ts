@@ -6,6 +6,7 @@
 export type UnauthenticatedStackParamList = {
   Login: undefined;
   Register: undefined;
+  RejectedApproval: undefined;
 };
 
 export type OnboardingStackParamList = {

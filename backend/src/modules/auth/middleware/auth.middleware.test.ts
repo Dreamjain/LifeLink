@@ -7,7 +7,7 @@ import { prisma } from '../../../database/prisma.js';
 import { env } from '../../../config/env.js';
 import { hashPassword } from '../utils/password.util.js';
 import { signAccessToken } from '../utils/jwt.util.js';
-import { requireAuth } from './auth.middleware.js';
+import { requireAuth, requirePatientStatusAuth } from './auth.middleware.js';
 
 const TEST_PHONE_PREFIX = '+1556';
 
@@ -144,5 +144,52 @@ describe('requireAuth', () => {
     expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'INACTIVE_ACCOUNT' }));
 
     await prisma.user.delete({ where: { id: user.id } });
+  });
+});
+
+describe('requirePatientStatusAuth', () => {
+  it('requires authentication', async () => {
+    const next = vi.fn();
+
+    await requirePatientStatusAuth(buildReq(undefined), buildRes(), next);
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'MISSING_TOKEN' }));
+  });
+
+  it('accepts a valid patient token for the status-only route', async () => {
+    const userId = randomUUID();
+    const token = signAccessToken({ userId, role: UserRole.PATIENT });
+    const req = buildReq(`Bearer ${token}`);
+    const next = vi.fn();
+
+    await requirePatientStatusAuth(req, buildRes(), next);
+
+    expect(next).toHaveBeenCalledWith();
+    expect(req.user).toMatchObject({ userId, role: UserRole.PATIENT });
+  });
+
+  it('does not permit another role to use the patient status route', async () => {
+    const token = signAccessToken({ userId: randomUUID(), role: UserRole.DRIVER });
+    const next = vi.fn();
+
+    await requirePatientStatusAuth(buildReq(`Bearer ${token}`), buildRes(), next);
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'INSUFFICIENT_ROLE' }));
+  });
+
+  it('preserves expired-token semantics', async () => {
+    const expired = jwt.sign({ role: UserRole.PATIENT }, env.JWT_SECRET, {
+      algorithm: 'HS256',
+      subject: randomUUID(),
+      issuer: env.JWT_ISSUER,
+      audience: env.JWT_AUDIENCE,
+      jwtid: randomUUID(),
+      expiresIn: '-1s',
+    });
+    const next = vi.fn();
+
+    await requirePatientStatusAuth(buildReq(`Bearer ${expired}`), buildRes(), next);
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'TOKEN_EXPIRED' }));
   });
 });

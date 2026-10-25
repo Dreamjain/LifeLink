@@ -107,6 +107,14 @@ export const login = async (input: LoginInput): Promise<LoginResult> => {
     throw new AppError('INVALID_CREDENTIALS', 'Invalid phone number or password.', 401);
   }
 
+  if (user.role === UserRole.PATIENT && user.status === UserStatus.REJECTED) {
+    throw new AppError(
+      'ACCOUNT_REJECTED',
+      'Your patient registration was rejected. Please contact LifeLink support for next steps.',
+      403,
+    );
+  }
+
   if (!canAuthenticate(user)) {
     throw new AppError('INACTIVE_ACCOUNT', 'This account is not active.', 403);
   }
@@ -135,4 +143,32 @@ export const getCurrentUser = async (principal: AuthenticatedPrincipal): Promise
   }
 
   return toSafeUser(user);
+};
+
+/**
+ * A minimal status read for a patient holding a previously issued token. Unlike `/auth/me`, this
+ * deliberately includes PENDING and REJECTED so onboarding can distinguish waiting, approval,
+ * and rejection. It returns no profile or other user data and is not an authorization grant.
+ */
+export const getPatientAccountStatus = async (
+  userId: string,
+): Promise<Pick<User, 'status'>['status']> => {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: { role: true, status: true },
+  });
+
+  if (!user || user.role !== UserRole.PATIENT) {
+    throw new AppError('INSUFFICIENT_ROLE', 'Patient account status is unavailable.', 403);
+  }
+
+  if (
+    user.status === UserStatus.PENDING ||
+    user.status === UserStatus.ACTIVE ||
+    user.status === UserStatus.REJECTED
+  ) {
+    return user.status;
+  }
+
+  throw new AppError('INACTIVE_ACCOUNT', 'This account is not active.', 403);
 };

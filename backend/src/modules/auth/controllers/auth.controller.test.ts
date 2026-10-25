@@ -8,7 +8,7 @@ import { requireAuth } from '../middleware/auth.middleware.js';
 import type { AuthenticatedPrincipal } from '../types/auth.types.js';
 import { requirePatientOnboardingAuth } from '../../patients/middleware/patient-onboarding-auth.middleware.js';
 import { getProfile as getPatientProfile } from '../../patients/controllers/patient.controller.js';
-import { login, me, register } from './auth.controller.js';
+import { login, me, patientStatus, register } from './auth.controller.js';
 
 const TEST_PHONE_PREFIX = '+1557';
 
@@ -282,7 +282,7 @@ describe('auth.controller login for a PENDING patient (Task 1.25 onboarding)', (
     );
   });
 
-  it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED, UserStatus.REJECTED])(
+  it.each([UserStatus.SUSPENDED, UserStatus.DEACTIVATED])(
     'refuses a %s patient over HTTP',
     async (status) => {
       const password = 'a-very-strong-passphrase';
@@ -325,6 +325,63 @@ describe('auth.controller login for a PENDING patient (Task 1.25 onboarding)', (
     expect(next).toHaveBeenCalledWith(
       expect.objectContaining({ code: 'INACTIVE_ACCOUNT', statusCode: 403 }),
     );
+  });
+
+  it('reports a rejected patient only after correct credentials are supplied', async () => {
+    const password = 'a-very-strong-passphrase';
+    const user = await prisma.user.create({
+      data: {
+        phone: randomTestPhone(),
+        email: `test.${randomUUID()}@example.com`,
+        passwordHash: await hashPassword(password),
+        role: UserRole.PATIENT,
+        status: UserStatus.REJECTED,
+        displayName: 'Rejected Patient',
+      },
+    });
+    const next = vi.fn();
+
+    await login(buildReq({ phone: user.phone, password }), buildRes(), next);
+
+    expect(next).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 'ACCOUNT_REJECTED', statusCode: 403 }),
+    );
+  });
+});
+
+describe('auth.controller patient status', () => {
+  it.each([UserStatus.PENDING, UserStatus.ACTIVE, UserStatus.REJECTED])(
+    'returns only the caller status %s',
+    async (status) => {
+      const user = await prisma.user.create({
+        data: {
+          phone: randomTestPhone(),
+          email: `test.${randomUUID()}@example.com`,
+          passwordHash: await hashPassword('a-very-strong-passphrase'),
+          role: UserRole.PATIENT,
+          status,
+          displayName: 'Patient Status Test',
+        },
+      });
+      const res = buildRes();
+
+      await patientStatus(
+        buildReq(undefined, { userId: user.id, role: UserRole.PATIENT, jti: randomUUID() }),
+        res,
+        vi.fn(),
+      );
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(jsonPayload(res)).toEqual({ status });
+    },
+  );
+
+  it('rejects a call without an authenticated principal', async () => {
+    const next = vi.fn();
+
+    await patientStatus(buildReq(undefined), buildRes(), next);
+
+    expect(next).toHaveBeenCalledWith(expect.objectContaining({ code: 'MISSING_TOKEN' }));
   });
 });
 
