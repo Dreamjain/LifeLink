@@ -7,7 +7,7 @@ import { getCurrentUser, getPatientAccountStatus, login } from '../src/api/endpo
 import { RootNavigator } from '../src/navigation/root-navigator';
 import { PendingApprovalScreen } from '../src/screens/PendingApprovalScreen';
 import { renderWithProviders } from '../src/test-support/render';
-import type { ApiUser, UserStatus } from '../src/types/api.types';
+import type { ApiUser, UserRole, UserStatus } from '../src/types/api.types';
 
 jest.mock('../src/api/endpoints', () => ({
   registerPatient: jest.fn(),
@@ -39,19 +39,19 @@ const getPatientAccountStatusMock = getPatientAccountStatus as jest.MockedFuncti
 >;
 const loginMock = login as jest.MockedFunction<typeof login>;
 
-const storedUser = (status: UserStatus): ApiUser => ({
+const storedUser = (status: UserStatus, role: UserRole = 'PATIENT'): ApiUser => ({
   id: 'user-1',
   phone: '+15550001111',
   email: null,
   displayName: 'Asha Rao',
-  role: 'PATIENT',
+  role,
   status,
   createdAt: '2026-01-01T00:00:00.000Z',
 });
 
-const seedSession = (status: UserStatus): void => {
+const seedSession = (status: UserStatus, role: UserRole = 'PATIENT'): void => {
   store.set(TOKEN_KEY, 'stored-token');
-  store.set(USER_KEY, JSON.stringify(storedUser(status)));
+  store.set(USER_KEY, JSON.stringify(storedUser(status, role)));
 };
 
 beforeEach(() => {
@@ -129,6 +129,50 @@ describe('the auth gate', () => {
     expect(screen.queryByTestId('registration-rejected')).toBeNull();
   });
 
+  it('signs in an active patient and persists the patient session', async () => {
+    loginMock.mockResolvedValue({
+      accessToken: 'patient-token',
+      tokenType: 'Bearer',
+      expiresIn: 3600,
+      user: storedUser('ACTIVE'),
+    });
+    const interaction = userEvent.setup();
+
+    await renderApp();
+    await interaction.type(await screen.findByTestId('login-phone'), '+15550001111');
+    await interaction.type(await screen.findByTestId('login-password'), 'correct-password');
+    await interaction.press(await screen.findByTestId('login-submit'));
+
+    expect(await screen.findByTestId('sos-button')).toBeOnTheScreen();
+    expect(store.get(TOKEN_KEY)).toBe('patient-token');
+    expect(store.get(USER_KEY)).toContain('PATIENT');
+  });
+
+  it.each(['DRIVER', 'HOSPITAL_STAFF', 'ADMIN'] as const)(
+    'rejects %s sign-in without persisting its session',
+    async (role) => {
+      loginMock.mockResolvedValue({
+        accessToken: 'unsupported-role-token',
+        tokenType: 'Bearer',
+        expiresIn: 3600,
+        user: storedUser('ACTIVE', role),
+      });
+      const interaction = userEvent.setup();
+
+      await renderApp();
+      await interaction.type(await screen.findByTestId('login-phone'), '+15550001111');
+      await interaction.type(await screen.findByTestId('login-password'), 'correct-password');
+      await interaction.press(await screen.findByTestId('login-submit'));
+
+      expect(await screen.findByTestId('login-error')).toHaveTextContent(
+        'This app is only for patients. Please sign in using the appropriate application.',
+      );
+      expect(screen.queryByTestId('sos-button')).toBeNull();
+      expect(setItemAsync).not.toHaveBeenCalled();
+      expect(store.has(TOKEN_KEY)).toBe(false);
+    },
+  );
+
   it('restores a PENDING patient into onboarding, not into the emergency screen', async () => {
     seedSession('PENDING');
 
@@ -187,6 +231,26 @@ describe('the auth gate', () => {
     expect(await screen.findByTestId('sos-button')).toBeOnTheScreen();
     expect(getCurrentUserMock).toHaveBeenCalledWith('stored-token');
     expect(screen.queryByText('Sign in')).toBeNull();
+  });
+
+  it.each(
+    (['ACTIVE', 'PENDING'] as const).flatMap((status) =>
+      (['DRIVER', 'HOSPITAL_STAFF', 'ADMIN'] as const).map((role) => [status, role] as const),
+    ),
+  )('clears a stored %s %s session without calling patient endpoints', async (status, role) => {
+    seedSession(status, role);
+
+    await renderApp();
+
+    expect(await screen.findByRole('header', { name: 'Sign in' })).toBeOnTheScreen();
+    await waitFor(() => {
+      expect(deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY);
+      expect(deleteItemAsync).toHaveBeenCalledWith(USER_KEY);
+    });
+    expect(getCurrentUserMock).not.toHaveBeenCalled();
+    expect(getPatientAccountStatusMock).not.toHaveBeenCalled();
+    expect(store.has(TOKEN_KEY)).toBe(false);
+    expect(store.has(USER_KEY)).toBe(false);
   });
 
   it('invalidates an ACTIVE stored session when the backend says the account is inactive', async () => {

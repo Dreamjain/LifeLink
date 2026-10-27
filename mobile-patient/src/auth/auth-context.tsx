@@ -54,6 +54,10 @@ export interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 const statusFor = (user: ApiUser): AuthStatus => {
+  if (user.role !== 'PATIENT') {
+    return 'unauthenticated';
+  }
+
   if (user.role === 'PATIENT' && user.status === 'REJECTED') {
     return 'rejected';
   }
@@ -62,8 +66,8 @@ const statusFor = (user: ApiUser): AuthStatus => {
     return 'active';
   }
 
-  // Only ACTIVE and PENDING patients can obtain a token at all, so anything else here means a
-  // stored session that the backend would now refuse. Treat it as signed out.
+  // Backend login is shared across roles. Only ACTIVE and PENDING patients are supported by
+  // this app; any other patient status means the stored session should be signed out.
   return user.status === 'PENDING' ? 'onboarding' : 'unauthenticated';
 };
 
@@ -236,6 +240,15 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
   const signIn = useCallback(
     async (phone: string, password: string): Promise<void> => {
       const result = await loginRequest({ phone: phone.trim(), password });
+
+      if (result.user.role !== 'PATIENT') {
+        throw new ApiError({
+          code: 'INSUFFICIENT_ROLE',
+          status: 403,
+          message:
+            'This app is only for patients. Please sign in using the appropriate application.',
+        });
+      }
 
       await adopt({ accessToken: result.accessToken, user: result.user });
     },
