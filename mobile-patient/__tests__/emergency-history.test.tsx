@@ -1,7 +1,7 @@
-import { screen, userEvent, waitFor } from '@testing-library/react-native';
+import { act, screen, userEvent, waitFor } from '@testing-library/react-native';
 import * as SecureStore from 'expo-secure-store';
 import { ApiError } from '../src/api/api-error';
-import { listEmergencies } from '../src/api/endpoints';
+import { createEmergency, getEmergency, listEmergencies } from '../src/api/endpoints';
 import { AuthProvider } from '../src/auth/auth-context';
 import { RootNavigator } from '../src/navigation/root-navigator';
 import { renderWithProviders } from '../src/test-support/render';
@@ -26,6 +26,8 @@ const getItemAsync = SecureStore.getItemAsync as jest.Mock;
 const setItemAsync = SecureStore.setItemAsync as jest.Mock;
 const deleteItemAsync = SecureStore.deleteItemAsync as jest.Mock;
 const listEmergenciesMock = listEmergencies as jest.MockedFunction<typeof listEmergencies>;
+const createEmergencyMock = createEmergency as jest.MockedFunction<typeof createEmergency>;
+const getEmergencyMock = getEmergency as jest.MockedFunction<typeof getEmergency>;
 const TOKEN_KEY = 'lifelink.patient.accessToken';
 const USER_KEY = 'lifelink.patient.user';
 const store = new Map<string, string>();
@@ -56,6 +58,17 @@ const listedEmergency: PatientEmergency = {
   expiresAt: null,
 };
 
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+
+  return { promise, resolve, reject };
+};
+
 beforeEach(() => {
   store.clear();
   store.set(TOKEN_KEY, 'stored-token');
@@ -71,6 +84,9 @@ beforeEach(() => {
     store.delete(key);
   });
   listEmergenciesMock.mockReset();
+  createEmergencyMock.mockReset();
+  getEmergencyMock.mockReset();
+  getEmergencyMock.mockResolvedValue({ emergency: listedEmergency });
 });
 
 const renderApp = () =>
@@ -122,5 +138,83 @@ describe('emergency history feedback', () => {
     await interaction.press(await screen.findByTestId('history-retry'));
     await waitFor(() => expect(listEmergenciesMock).toHaveBeenCalledTimes(2));
     expect(await screen.findByTestId(`emergency-${listedEmergency.id}`)).toBeOnTheScreen();
+  });
+
+  it('ignores an older history response that arrives after a newer focus request', async () => {
+    const olderRequest = deferred<{ emergencies: PatientEmergency[] }>();
+    const newerRequest = deferred<{ emergencies: PatientEmergency[] }>();
+    const olderEmergency = { ...listedEmergency, id: 'older-history-result' };
+    const newerEmergency = { ...listedEmergency, id: 'newer-history-result' };
+    listEmergenciesMock
+      .mockReturnValueOnce(olderRequest.promise)
+      .mockReturnValueOnce(newerRequest.promise);
+    createEmergencyMock.mockResolvedValue({
+      emergency: listedEmergency,
+      idempotentReplay: false,
+    });
+    const interaction = userEvent.setup();
+
+    await renderApp();
+    await waitFor(() => expect(listEmergenciesMock).toHaveBeenCalledTimes(1));
+
+    // Open and leave the detail screen to create a second Home focus/load cycle while the first
+    // history request is still pending.
+    await interaction.press(await screen.findByTestId('sos-button'));
+    await interaction.press(await screen.findByTestId('detail-back'));
+    await waitFor(() => expect(listEmergenciesMock).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      newerRequest.resolve({ emergencies: [newerEmergency] });
+      await newerRequest.promise;
+    });
+    expect(await screen.findByTestId(`emergency-${newerEmergency.id}`)).toBeOnTheScreen();
+    expect(screen.queryByTestId('history-loading')).toBeNull();
+
+    await act(async () => {
+      olderRequest.resolve({ emergencies: [olderEmergency] });
+      await olderRequest.promise;
+    });
+
+    expect(screen.getByTestId(`emergency-${newerEmergency.id}`)).toBeOnTheScreen();
+    expect(screen.queryByTestId(`emergency-${olderEmergency.id}`)).toBeNull();
+    expect(screen.queryByTestId('history-error')).toBeNull();
+    expect(screen.queryByTestId('history-loading')).toBeNull();
+  });
+
+  it('does not let a stale error replace a newer history result or loading state', async () => {
+    const olderRequest = deferred<{ emergencies: PatientEmergency[] }>();
+    const newerRequest = deferred<{ emergencies: PatientEmergency[] }>();
+    const newerEmergency = { ...listedEmergency, id: 'confirmed-newer-result' };
+    listEmergenciesMock
+      .mockReturnValueOnce(olderRequest.promise)
+      .mockReturnValueOnce(newerRequest.promise);
+    createEmergencyMock.mockResolvedValue({
+      emergency: listedEmergency,
+      idempotentReplay: false,
+    });
+    const interaction = userEvent.setup();
+
+    await renderApp();
+    await waitFor(() => expect(listEmergenciesMock).toHaveBeenCalledTimes(1));
+    await interaction.press(await screen.findByTestId('sos-button'));
+    await interaction.press(await screen.findByTestId('detail-back'));
+    await waitFor(() => expect(listEmergenciesMock).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      newerRequest.resolve({ emergencies: [newerEmergency] });
+      await newerRequest.promise;
+    });
+    expect(await screen.findByTestId(`emergency-${newerEmergency.id}`)).toBeOnTheScreen();
+
+    await act(async () => {
+      olderRequest.reject(
+        new ApiError({ code: 'NETWORK_ERROR', message: 'Stale offline.', status: 0 }),
+      );
+      await olderRequest.promise.catch(() => undefined);
+    });
+
+    expect(screen.getByTestId(`emergency-${newerEmergency.id}`)).toBeOnTheScreen();
+    expect(screen.queryByTestId('history-error')).toBeNull();
+    expect(screen.queryByTestId('history-loading')).toBeNull();
   });
 });

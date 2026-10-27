@@ -368,6 +368,57 @@ describe('the auth gate', () => {
     });
   });
 
+  it('clears a DEACTIVATED patient session and returns to sign-in', async () => {
+    seedSession('DEACTIVATED');
+
+    await renderApp();
+
+    expect(await screen.findByRole('header', { name: 'Sign in' })).toBeOnTheScreen();
+    await waitFor(() => {
+      expect(deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY);
+      expect(deleteItemAsync).toHaveBeenCalledWith(USER_KEY);
+    });
+    expect(getCurrentUserMock).not.toHaveBeenCalled();
+    expect(getPatientAccountStatusMock).not.toHaveBeenCalled();
+  });
+
+  it('clears an ACTIVE session if /auth/me reports that its role changed', async () => {
+    seedSession('ACTIVE');
+    getCurrentUserMock.mockResolvedValue({ user: storedUser('ACTIVE', 'DRIVER') });
+
+    await renderApp();
+
+    expect(await screen.findByRole('header', { name: 'Sign in' })).toBeOnTheScreen();
+    await waitFor(() => {
+      expect(deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY);
+      expect(deleteItemAsync).toHaveBeenCalledWith(USER_KEY);
+    });
+    expect(getCurrentUserMock).toHaveBeenCalledWith('stored-token');
+    expect(getPatientAccountStatusMock).not.toHaveBeenCalled();
+    expect(setItemAsync).not.toHaveBeenCalled();
+    expect(store.has(TOKEN_KEY)).toBe(false);
+    expect(store.has(USER_KEY)).toBe(false);
+  });
+
+  it('clears a PENDING session if approval changes but /auth/me reports a non-patient role', async () => {
+    seedSession('PENDING');
+    getPatientAccountStatusMock.mockResolvedValue({ status: 'ACTIVE' });
+    getCurrentUserMock.mockResolvedValue({ user: storedUser('ACTIVE', 'DRIVER') });
+
+    await renderApp();
+
+    expect(await screen.findByRole('header', { name: 'Sign in' })).toBeOnTheScreen();
+    await waitFor(() => {
+      expect(deleteItemAsync).toHaveBeenCalledWith(TOKEN_KEY);
+      expect(deleteItemAsync).toHaveBeenCalledWith(USER_KEY);
+    });
+    expect(getPatientAccountStatusMock).toHaveBeenCalledWith('stored-token');
+    expect(getCurrentUserMock).toHaveBeenCalledWith('stored-token');
+    expect(setItemAsync).not.toHaveBeenCalled();
+    expect(store.has(TOKEN_KEY)).toBe(false);
+    expect(store.has(USER_KEY)).toBe(false);
+  });
+
   it('treats an unreadable stored session as no session', async () => {
     store.set(TOKEN_KEY, 'stored-token');
     store.set(USER_KEY, 'not-json');

@@ -95,6 +95,7 @@ describe('emergency contact loading recovery', () => {
   it('clears unconfirmed contacts after a successful mutation and failed reload', async () => {
     listContactsMock
       .mockResolvedValueOnce({ contacts: [contact] })
+      .mockResolvedValueOnce({ contacts: [contact] })
       .mockRejectedValueOnce(new Error('offline after create'));
     createContactMock.mockResolvedValue({ contact: { ...contact, id: 'contact-2' } });
     const interaction = userEvent.setup();
@@ -110,7 +111,7 @@ describe('emergency contact loading recovery', () => {
     await interaction.press(view.getByTestId('contact-submit'));
 
     await waitFor(() => expect(createContactMock).toHaveBeenCalledTimes(1));
-    await waitFor(() => expect(listContactsMock).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(listContactsMock).toHaveBeenCalledTimes(3));
     expect(await view.findByTestId('contacts-error')).toBeOnTheScreen();
     expect(view.queryByTestId(`contact-${contact.id}`)).toBeNull();
     expect(view.getByTestId('contacts-continue').props.accessibilityState.disabled).toBe(true);
@@ -127,9 +128,11 @@ describe('emergency contact loading recovery', () => {
 
   it('ignores an older contact-list response that arrives after a newer empty result', async () => {
     const olderRequest = deferred<{ contacts: EmergencyContact[] }>();
+    const baselineRequest = deferred<{ contacts: EmergencyContact[] }>();
     const newerRequest = deferred<{ contacts: EmergencyContact[] }>();
     listContactsMock
       .mockReturnValueOnce(olderRequest.promise)
+      .mockReturnValueOnce(baselineRequest.promise)
       .mockReturnValueOnce(newerRequest.promise);
     createContactMock.mockResolvedValue({ contact: secondContact });
     const interaction = userEvent.setup();
@@ -141,6 +144,12 @@ describe('emergency contact loading recovery', () => {
     await fireEvent.changeText(view.getByTestId('contact-phone'), '+15557654321');
     await interaction.press(view.getByTestId('contact-submit'));
     await waitFor(() => expect(listContactsMock).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      baselineRequest.resolve({ contacts: [] });
+      await baselineRequest.promise;
+    });
+    await waitFor(() => expect(listContactsMock).toHaveBeenCalledTimes(3));
 
     await act(async () => {
       newerRequest.resolve({ contacts: [] });
@@ -208,5 +217,121 @@ describe('emergency contact loading recovery', () => {
     await interaction.press(view.getByTestId('contacts-retry'));
     expect(await view.findByTestId(`contact-${secondContact.id}`)).toBeOnTheScreen();
     expect(view.getByTestId('contacts-continue').props.accessibilityState.disabled).toBe(false);
+  });
+
+  it('treats an ambiguous create as successful when a new matching contact appears', async () => {
+    const submittedContact: EmergencyContact = {
+      ...secondContact,
+      id: 'contact-created-after-lost-response',
+      phone: '+15557654321',
+      isPrimary: true,
+    };
+    listContactsMock
+      .mockResolvedValueOnce({ contacts: [contact] })
+      .mockResolvedValueOnce({ contacts: [contact] })
+      .mockResolvedValueOnce({ contacts: [contact, submittedContact] });
+    createContactMock.mockRejectedValueOnce(new Error('response lost after server commit'));
+    const interaction = userEvent.setup();
+
+    const view = await renderScreen();
+    expect(await view.findByTestId(`contact-${contact.id}`)).toBeOnTheScreen();
+    await fireEvent.changeText(view.getByTestId('contact-name'), submittedContact.name);
+    await fireEvent.changeText(
+      view.getByTestId('contact-relationship'),
+      submittedContact.relationship,
+    );
+    await fireEvent.changeText(view.getByTestId('contact-phone'), submittedContact.phone);
+    await interaction.press(view.getByTestId('contact-submit'));
+
+    await waitFor(() => expect(createContactMock).toHaveBeenCalledTimes(1));
+    expect(await view.findByTestId(`contact-${submittedContact.id}`)).toBeOnTheScreen();
+    expect(view.getByTestId('contact-name').props.value).toBe('');
+    expect(view.getByTestId('contact-relationship').props.value).toBe('');
+    expect(view.getByTestId('contact-phone').props.value).toBe('');
+    expect(view.queryByTestId('contacts-error')).toBeNull();
+    expect(view.getByTestId('contacts-continue').props.accessibilityState.disabled).toBe(false);
+  });
+
+  it('preserves the form and allows retry when reconciliation confirms no new matching contact', async () => {
+    listContactsMock
+      .mockResolvedValueOnce({ contacts: [] })
+      .mockResolvedValueOnce({ contacts: [] })
+      .mockResolvedValueOnce({ contacts: [] });
+    createContactMock.mockRejectedValueOnce(new Error('connection dropped before create'));
+    const interaction = userEvent.setup();
+
+    const view = await renderScreen();
+    expect(await view.findByTestId('contacts-empty')).toBeOnTheScreen();
+    await fireEvent.changeText(view.getByTestId('contact-name'), 'Maya Rao');
+    await fireEvent.changeText(view.getByTestId('contact-relationship'), 'Sister');
+    await fireEvent.changeText(view.getByTestId('contact-phone'), '+15557654321');
+    await interaction.press(view.getByTestId('contact-submit'));
+
+    expect(await view.findByTestId('contacts-error')).toHaveTextContent(
+      /No new matching contact is currently listed\./,
+    );
+    expect(view.getByTestId('contact-name').props.value).toBe('Maya Rao');
+    expect(view.getByTestId('contact-relationship').props.value).toBe('Sister');
+    expect(view.getByTestId('contact-phone').props.value).toBe('+15557654321');
+    expect(view.getByTestId('contact-submit').props.accessibilityState.disabled).toBe(false);
+    expect(createContactMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the result explicitly unconfirmed when POST and reconciliation both fail', async () => {
+    listContactsMock
+      .mockResolvedValueOnce({ contacts: [] })
+      .mockResolvedValueOnce({ contacts: [] })
+      .mockRejectedValueOnce(new Error('reconciliation offline'))
+      .mockResolvedValueOnce({ contacts: [] });
+    createContactMock.mockRejectedValueOnce(new Error('POST outcome unknown'));
+    const interaction = userEvent.setup();
+
+    const view = await renderScreen();
+    expect(await view.findByTestId('contacts-empty')).toBeOnTheScreen();
+    await fireEvent.changeText(view.getByTestId('contact-name'), 'Maya Rao');
+    await fireEvent.changeText(view.getByTestId('contact-relationship'), 'Sister');
+    await fireEvent.changeText(view.getByTestId('contact-phone'), '+15557654321');
+    await interaction.press(view.getByTestId('contact-submit'));
+
+    expect(await view.findByTestId('contacts-error')).toHaveTextContent(
+      /Could not confirm whether the contact was added\./,
+    );
+    expect(view.getByTestId('contacts-retry')).toBeOnTheScreen();
+    expect(view.getByTestId('contacts-continue').props.accessibilityState.disabled).toBe(true);
+    expect(view.getByTestId('contact-name').props.value).toBe('Maya Rao');
+    expect(view.getByTestId('contact-submit').props.accessibilityState.disabled).toBe(true);
+    expect(createContactMock).toHaveBeenCalledTimes(1);
+
+    await interaction.press(view.getByTestId('contacts-retry'));
+
+    expect(await view.findByTestId('contacts-error')).toHaveTextContent(
+      /No new matching contact is currently listed\./,
+    );
+    expect(view.getByTestId('contact-submit').props.accessibilityState.disabled).toBe(false);
+    expect(view.getByTestId('contact-name').props.value).toBe('Maya Rao');
+    expect(createContactMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not treat a matching contact from the pre-submit snapshot as a successful create', async () => {
+    listContactsMock
+      .mockResolvedValueOnce({ contacts: [contact] })
+      .mockResolvedValueOnce({ contacts: [contact] })
+      .mockResolvedValueOnce({ contacts: [contact] });
+    createContactMock.mockRejectedValueOnce(new Error('ambiguous POST failure'));
+    const interaction = userEvent.setup();
+
+    const view = await renderScreen();
+    expect(await view.findByTestId(`contact-${contact.id}`)).toBeOnTheScreen();
+    await fireEvent.changeText(view.getByTestId('contact-name'), contact.name);
+    await fireEvent.changeText(view.getByTestId('contact-relationship'), contact.relationship);
+    await fireEvent.changeText(view.getByTestId('contact-phone'), contact.phone);
+    await interaction.press(view.getByTestId('contact-submit'));
+
+    expect(await view.findByTestId('contacts-error')).toHaveTextContent(
+      /No new matching contact is currently listed\./,
+    );
+    expect(view.getByTestId('contact-name').props.value).toBe(contact.name);
+    expect(view.getByTestId(`contact-${contact.id}`)).toBeOnTheScreen();
+    expect(createContactMock).toHaveBeenCalledTimes(1);
   });
 });

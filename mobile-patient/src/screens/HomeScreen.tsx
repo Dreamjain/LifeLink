@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Pressable, StyleSheet, Text, View } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import type { NativeStackScreenProps } from '@react-navigation/native-stack';
@@ -40,29 +40,47 @@ export const HomeScreen = ({ navigation }: Props) => {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const latestHistoryRequest = useRef(0);
 
   const load = useCallback(async (): Promise<void> => {
+    const requestId = ++latestHistoryRequest.current;
     setHistoryLoading(true);
     setHistoryError(null);
 
     try {
       const result = await listEmergencies(token);
 
+      if (requestId !== latestHistoryRequest.current) {
+        return;
+      }
+
       setEmergencies(result.emergencies);
     } catch (caught) {
+      if (requestId !== latestHistoryRequest.current) {
+        return;
+      }
+
       setHistoryError(
         caught instanceof ApiError
           ? caught.displayMessage
           : 'Could not load your emergency history. Please try again.',
       );
     } finally {
-      setHistoryLoading(false);
+      if (requestId === latestHistoryRequest.current) {
+        setHistoryLoading(false);
+      }
     }
   }, [token]);
 
   useFocusEffect(
     useCallback(() => {
       void load();
+
+      return () => {
+        // A blurred screen must not accept a response from its previous focus period. The next
+        // focus starts a new request and owns the loading/error/data state from that point on.
+        latestHistoryRequest.current += 1;
+      };
     }, [load]),
   );
 

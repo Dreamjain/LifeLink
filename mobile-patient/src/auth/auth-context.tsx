@@ -170,6 +170,18 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       if (nextStatus === 'active') {
         try {
           const { user } = await getCurrentUser(stored.accessToken);
+
+          if (user.role !== 'PATIENT') {
+            await clearSession();
+
+            if (!cancelled && mounted.current) {
+              setSession(null);
+              setStatus('unauthenticated');
+            }
+
+            return;
+          }
+
           restored = { ...stored, user };
           await saveSession(restored);
         } catch (error) {
@@ -189,6 +201,17 @@ export const AuthProvider = ({ children }: { children: ReactNode }) => {
       } else if (nextStatus === 'onboarding' && stored.user.role === 'PATIENT') {
         try {
           restored = await refreshPendingPatientSession(stored);
+
+          if (restored.user.role !== 'PATIENT') {
+            await clearSession();
+
+            if (!cancelled && mounted.current) {
+              setSession(null);
+              setStatus('unauthenticated');
+            }
+
+            return;
+          }
 
           if (restored !== stored) {
             await saveSession(restored);

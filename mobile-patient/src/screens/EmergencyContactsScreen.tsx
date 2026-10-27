@@ -14,6 +14,30 @@ import type { EmergencyContact } from '../types/api.types';
 
 type Props = NativeStackScreenProps<OnboardingStackParamList, 'EmergencyContacts'>;
 
+interface ContactDraft {
+  name: string;
+  relationship: string;
+  phone: string;
+  isPrimary: boolean;
+}
+
+interface PendingContactCreate {
+  draft: ContactDraft;
+  baselineContactIds: Set<string>;
+}
+
+const contactMatchesDraft = (contact: EmergencyContact, draft: ContactDraft): boolean =>
+  contact.name.trim().toLocaleLowerCase() === draft.name.toLocaleLowerCase() &&
+  contact.relationship.trim().toLocaleLowerCase() === draft.relationship.toLocaleLowerCase() &&
+  contact.phone.trim() === draft.phone &&
+  contact.isPrimary === draft.isPrimary;
+
+const isAmbiguousCreateFailure = (error: unknown): boolean =>
+  !(error instanceof ApiError) || error.status === 0 || error.status === 408 || error.status >= 500;
+
+const UNCERTAIN_CREATE_MESSAGE =
+  'Could not confirm whether the contact was added. Reload your contacts before trying again.';
+
 export const EmergencyContactsScreen = ({ navigation }: Props) => {
   const token = useAuthToken();
 
@@ -28,8 +52,9 @@ export const EmergencyContactsScreen = ({ navigation }: Props) => {
   const [removingContactId, setRemovingContactId] = useState<string | null>(null);
   const latestLoadRequest = useRef(0);
   const mutationInProgress = useRef(false);
+  const pendingContactCreate = useRef<PendingContactCreate | null>(null);
 
-  const load = useCallback(async (): Promise<boolean> => {
+  const load = useCallback(async (): Promise<EmergencyContact[] | null> => {
     const requestId = ++latestLoadRequest.current;
     setLoadStatus('loading');
     setError(null);
@@ -38,15 +63,15 @@ export const EmergencyContactsScreen = ({ navigation }: Props) => {
       const result = await listContacts(token);
 
       if (requestId !== latestLoadRequest.current) {
-        return false;
+        return null;
       }
 
       setContacts(result.contacts);
       setLoadStatus('loaded');
-      return true;
+      return result.contacts;
     } catch (caught) {
       if (requestId !== latestLoadRequest.current) {
-        return false;
+        return null;
       }
 
       // Do not treat previously displayed contacts as current after the server could not confirm
@@ -58,9 +83,46 @@ export const EmergencyContactsScreen = ({ navigation }: Props) => {
           ? caught.displayMessage
           : 'Could not load your emergency contacts.',
       );
-      return false;
+      return null;
     }
   }, [token]);
+
+  const reconcilePendingCreate = (confirmedContacts: EmergencyContact[] | null): void => {
+    const pending = pendingContactCreate.current;
+
+    if (pending === null) {
+      return;
+    }
+
+    if (confirmedContacts === null) {
+      setError(UNCERTAIN_CREATE_MESSAGE);
+      return;
+    }
+
+    const newlyObservedMatch = confirmedContacts.some(
+      (contact) =>
+        !pending.baselineContactIds.has(contact.id) && contactMatchesDraft(contact, pending.draft),
+    );
+
+    pendingContactCreate.current = null;
+
+    if (newlyObservedMatch) {
+      setName('');
+      setRelationship('');
+      setPhone('');
+      setError(null);
+      return;
+    }
+
+    setError(
+      'No new matching contact is currently listed. Your details are preserved; you may retry.',
+    );
+  };
+
+  const retryLoad = async (): Promise<void> => {
+    const confirmedContacts = await load();
+    reconcilePendingCreate(confirmedContacts);
+  };
 
   useEffect(() => {
     void load();
@@ -75,18 +137,48 @@ export const EmergencyContactsScreen = ({ navigation }: Props) => {
     setError(null);
     setBusy(true);
 
-    try {
-      await createContact(token, {
-        name: name.trim(),
-        relationship: relationship.trim(),
-        phone: phone.trim(),
-        isPrimary,
-      });
+    const draft: ContactDraft = {
+      name: name.trim(),
+      relationship: relationship.trim(),
+      phone: phone.trim(),
+      isPrimary,
+    };
 
-      setName('');
-      setRelationship('');
-      setPhone('');
-      await load();
+    try {
+      // Capture a fresh authoritative baseline so a contact that already existed cannot be
+      // mistaken for the result of a POST whose response was lost.
+      const baselineContacts = await load();
+
+      if (baselineContacts === null) {
+        setError(
+          'Could not confirm your existing contacts. The new contact was not submitted; retry loading first.',
+        );
+        return;
+      }
+
+      const pending: PendingContactCreate = {
+        draft,
+        baselineContactIds: new Set(baselineContacts.map((contact) => contact.id)),
+      };
+
+      try {
+        await createContact(token, draft);
+        pendingContactCreate.current = null;
+        setName('');
+        setRelationship('');
+        setPhone('');
+        await load();
+      } catch (caught) {
+        if (!isAmbiguousCreateFailure(caught)) {
+          setError(
+            caught instanceof ApiError ? caught.displayMessage : 'Could not add that contact.',
+          );
+          return;
+        }
+
+        pendingContactCreate.current = pending;
+        reconcilePendingCreate(await load());
+      }
     } catch (caught) {
       setError(
         caught instanceof ApiError
@@ -120,7 +212,7 @@ export const EmergencyContactsScreen = ({ navigation }: Props) => {
       // If the delete failed but the follow-up read succeeded, keep the mutation error visible.
       // If the read also failed, load() has already cleared unconfirmed contacts and shown its
       // retryable load error.
-      if (reconciled) {
+      if (reconciled !== null) {
         setError(mutationError);
       }
     } finally {
@@ -153,7 +245,7 @@ export const EmergencyContactsScreen = ({ navigation }: Props) => {
           label="Retry loading contacts"
           variant="secondary"
           onPress={() => {
-            void load();
+            void retryLoad();
           }}
           testID="contacts-retry"
         />
@@ -244,7 +336,7 @@ export const EmergencyContactsScreen = ({ navigation }: Props) => {
           void add();
         }}
         busy={busy}
-        disabled={!canSubmit || removingContactId !== null}
+        disabled={!canSubmit || removingContactId !== null || pendingContactCreate.current !== null}
         testID="contact-submit"
       />
 
